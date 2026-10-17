@@ -1063,7 +1063,7 @@ func (r *RedisQueueConsumer) emitReplayRecomputedBalancesAfterMetric(ctx context
 	}
 }
 
-// rootContext is the context the loop starts from: empty except for the service tracer.
+// rootContext is the context the loop starts from: the service tracer and the consumer logger.
 func (r *RedisQueueConsumer) rootContext() context.Context {
-	return contextWithServiceTracer(context.Background(), r.tracer)
+	return libObservability.ContextWithLogger(contextWithServiceTracer(context.Background(), r.tracer), r.Logger)
 }

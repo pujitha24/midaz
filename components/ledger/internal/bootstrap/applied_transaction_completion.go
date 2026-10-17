@@ -20,7 +20,7 @@ func configureAppliedTransactionCompletion(consumer *RedisQueueConsumer, useCase
 	}
 
 	delegate, err := command.NewTransactionCompletionServiceWithEvents(
-		postgresCompletion.NewStore(useCase.TransactionRepo, useCase.OperationRepo, maxRowsPerInsert...),
+		postgresCompletion.NewStore(useCase.TransactionRepo, useCase.OperationRepo, maxRowsPerInsert...).WithMetricsFactory(useCase.MetricsFactory),
 		useCase.TransactionMetadataRepo,
 		useCase,
 	)

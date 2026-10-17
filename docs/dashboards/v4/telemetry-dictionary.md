@@ -53,6 +53,7 @@ instrument type and unit:
 | `balance_sync_cleanup_failures_total` | `1` | Counter | `balance_sync_cleanup_failures_total` |
 | `balance_sync_tenant_skip_total` | `1` | Counter | `balance_sync_tenant_skip_total` |
 | `balance_sync_orphan_dropped_total` | `1` | Counter | `balance_sync_orphan_dropped_total` |
+| `balance_version_forked_total` | `1` | Counter | `balance_version_forked_total` |
 | `balance_sync_last_success_timestamp` | `s` | Gauge | `balance_sync_last_success_timestamp_seconds` |
 | `tenant_dependency_up` | `1` | Gauge | `tenant_dependency_up_ratio` |
 | `tenant_dependency_probe_failures_total` | `1` | Counter | `tenant_dependency_probe_failures_total` |
@@ -229,6 +230,20 @@ unit: "1"
 `reason="expired"` is data loss: the pending delta is unrecoverable. `reason="unparseable"` is
 a key-format regression. Alert on them separately; the alert rules and the response procedure
 are maintained outside this repository.
+
+### balance_version_forked_total
+
+```yaml
+declared_at: pkg/utils/metrics.go:190
+declared_name: balance_version_forked_total
+description: Completed operations reported for reusing a balance version another operation of the same balance already recorded.
+labels: [organization_id, ledger_id, tenant_id]
+label_cardinality_estimate: unbounded
+live_observed: unknown
+unit: "1"
+```
+
+Any non-zero value is a forked balance; see docs/architecture/engine.md.
 
 ### balance_sync_last_success_timestamp_seconds
 
