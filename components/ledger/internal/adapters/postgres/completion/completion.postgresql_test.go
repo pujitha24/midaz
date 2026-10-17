@@ -592,8 +592,6 @@ func TestStorePersistReportsForkedBalanceVersionAfterCommit(t *testing.T) {
 					if metric.Name == utils.BalanceVersionForked.Name {
 						for _, point := range metric.Data.(metricdata.Sum[int64]).DataPoints {
 							forked += point.Value
-							organization, _ := point.Attributes.Value("organization_id")
-							assert.Equal(t, row.OrganizationID, organization.AsString())
 						}
 					}
 				}

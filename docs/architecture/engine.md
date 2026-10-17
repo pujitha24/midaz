@@ -931,7 +931,22 @@ value is a fork for an operator to resolve: alert on
 `balance_version_forked_total > 0`, since the series appears on the first fork
 and `increase()` misses it. The check runs in every transaction completion and
 needs `idx_operation_balance_version` valid in every tenant schema; without it
-every completion scans the account's operation trail.
+every completion scans the account's operation trail. Migration `000046` builds
+it `CONCURRENTLY`, so an interrupted build leaves it invalid and a re-run skips
+it. Before rolling out a ledger version that carries this check, list the tenant
+schemas whose index is invalid and those that lack it:
+
+```sql
+SELECT n.nspname, i.indisvalid FROM pg_namespace n
+LEFT JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = 'idx_operation_balance_version'
+LEFT JOIN pg_index i ON i.indexrelid = c.oid
+WHERE EXISTS (SELECT 1 FROM pg_class t WHERE t.relnamespace = n.oid AND t.relname = 'operation' AND t.relkind IN ('r', 'p'))
+  AND i.indisvalid IS DISTINCT FROM true;
+```
+
+Repair an invalid index with `REINDEX INDEX CONCURRENTLY
+<schema>.idx_operation_balance_version`; for a missing one, run migration
+`000046` in that schema.
 
 A fee defers only when its package sets `deferrable: true` on it, which only a
 non-deductible fee accepts; without it an unfunded fee is still refused with

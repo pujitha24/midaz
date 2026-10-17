@@ -33,6 +33,15 @@ func (store *Store) reportForks(ctx context.Context, forks map[*operation.Operat
 	logger := libObservability.NewLoggerFromContext(ctx)
 	tenantID := tmcore.GetTenantIDContext(ctx)
 
+	var counter *metrics.CounterBuilder
+
+	if store.metrics != nil {
+		var err error
+		if counter, err = store.metrics.Counter(utils.BalanceVersionForked); err != nil {
+			logger.Log(ctx, libLog.LevelDebug, "Failed to build balance version fork counter", libLog.Err(err))
+		}
+	}
+
 	for row, twin := range forks {
 		logger.Log(ctx, libLog.LevelError, "Balance version recorded by two operations: the balance forked from its operations",
 			libLog.String("organization_id", row.OrganizationID), libLog.String("ledger_id", row.LedgerID),
@@ -41,16 +50,12 @@ func (store *Store) reportForks(ctx context.Context, forks map[*operation.Operat
 			libLog.String("twin_operation_id", twin),
 			libLog.Any("balance_version_before", row.Balance.Version), libLog.Any("balance_version_after", row.BalanceAfter.Version))
 
-		if store.metrics == nil {
+		if counter == nil {
 			continue
 		}
 
-		counter, err := store.metrics.Counter(utils.BalanceVersionForked)
-		if err == nil {
-			err = counter.WithLabels(map[string]string{"organization_id": row.OrganizationID, "ledger_id": row.LedgerID, "tenant_id": tenantID}).Add(ctx, 1)
-		}
-
-		if err != nil {
+		labels := map[string]string{"organization_id": row.OrganizationID, "ledger_id": row.LedgerID, "tenant_id": tenantID}
+		if err := counter.WithLabels(labels).Add(ctx, 1); err != nil {
 			logger.Log(ctx, libLog.LevelDebug, "Failed to emit balance version fork counter", libLog.Err(err))
 		}
 	}

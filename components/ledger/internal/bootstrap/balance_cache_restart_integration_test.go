@@ -465,10 +465,6 @@ func (h *balanceCacheRestartHarness) verifyTrail(t *testing.T, expectFork bool) 
 				first[op.after.version] = op.id
 			}
 
-			if expectFork {
-				continue
-			}
-
 			switch {
 			case op.before.version < previous.version:
 				breaks = append(breaks, fmt.Sprintf("version regression: T%d starts at %s, the previous operation ended at %s", op.order, op.before, previous))
