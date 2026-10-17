@@ -26,10 +26,14 @@ func (store *Store) WithMetricsFactory(factory *metrics.MetricsFactory) *Store {
 // forkTwinColumn finds another live operation at the same balance version; replays reuse the id.
 const forkTwinColumn = `(SELECT twin.id FROM operation twin WHERE operation.balance_version_after > 0 AND twin.organization_id = operation.organization_id AND twin.ledger_id = operation.ledger_id
 AND twin.account_id = operation.account_id AND twin.balance_id = operation.balance_id AND twin.balance_version_after = operation.balance_version_after
-AND twin.deleted_at IS NULL AND twin.balance_affected = true AND twin.id <> operation.id LIMIT 1)`
+AND twin.deleted_at IS NULL AND twin.balance_affected = true AND twin.id <> operation.id ORDER BY twin.id LIMIT 1)`
 
 // reportForks logs and counts each committed fork; it never alters the outcome.
 func (store *Store) reportForks(ctx context.Context, forks map[*operation.Operation]string) {
+	if len(forks) == 0 {
+		return
+	}
+
 	logger := libObservability.NewLoggerFromContext(ctx)
 	tenantID := tmcore.GetTenantIDContext(ctx)
 
