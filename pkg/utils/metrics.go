@@ -185,6 +185,13 @@ var (
 		Description: "Total cache-miss balance seeds rebuilt from the operation trail because the balance row was stale.",
 	}
 
+	// BalanceVersionForked is labelled by organization_id, ledger_id and tenant_id (empty in single-tenant).
+	BalanceVersionForked = metrics.Metric{
+		Name:        "balance_version_forked_total",
+		Unit:        "1",
+		Description: "Completed operations reported for reusing a balance version another operation of the same balance already recorded.",
+	}
+
 	// ConfigKeyReloaded counts configurations reloaded from the PostgreSQL primary
 	// before an engine execution because their configuration key was absent, by
 	// family (balance|account). Absence is normal after a deploy and on every expiry

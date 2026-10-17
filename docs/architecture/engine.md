@@ -920,6 +920,19 @@ production instance's persistence and eviction policy before enabling deferrable
 fees, and compare the receivable lists with the `fee_debt` projection to detect
 divergence; the projection is never a source for rebuilding a lost list.
 
+A balance blob that comes back older than the operation trail (a snapshot or
+backup restore, a failover to a replica that missed writes, AOF `everysec` after
+a host crash) is not caught by the engine: later operations reuse its versions
+and the balance forks from its operations. The completer reports a reused
+version when the second of the two operations completes, as
+`balance_version_forked_total` plus an Error log naming the other operation;
+two operations that complete concurrently can both go unreported. Any non-zero
+value is a fork for an operator to resolve: alert on
+`balance_version_forked_total > 0`, since the series appears on the first fork
+and `increase()` misses it. The check runs in every transaction completion and
+needs `idx_operation_balance_version` valid in every tenant schema; without it
+every completion scans the account's operation trail.
+
 A fee defers only when its package sets `deferrable: true` on it, which only a
 non-deductible fee accepts; without it an unfunded fee is still refused with
 `0018`. A partly deferred fee books only the share the payer funded: the

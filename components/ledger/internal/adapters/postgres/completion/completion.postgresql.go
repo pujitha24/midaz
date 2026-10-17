@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	libObservability "github.com/LerianStudio/lib-observability/v4"
+	"github.com/LerianStudio/lib-observability/v4/metrics"
 	libOpentelemetry "github.com/LerianStudio/lib-observability/v4/tracing"
 	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/trace"
@@ -40,6 +41,7 @@ type Store struct {
 	transactions     transactionRepository
 	operations       operationRepository
 	maxRowsPerInsert int
+	metrics          *metrics.MetricsFactory
 }
 
 const defaultMaxRowsPerInsert = 1000
@@ -138,8 +140,10 @@ func (store *Store) PersistWithOutcome(ctx context.Context, record command.Trans
 		}
 	}
 
+	forks := map[*operation.Operation]string{}
+
 	for _, row := range record.Transaction.Operations {
-		if err := verifyOperation(ctx, querier, row); err != nil {
+		if err := verifyOperation(ctx, querier, row, forks); err != nil {
 			return command.TransactionPersistenceOutcome{}, err
 		}
 	}
@@ -153,6 +157,8 @@ func (store *Store) PersistWithOutcome(ctx context.Context, record command.Trans
 	}
 
 	committed = true
+
+	store.reportForks(ctx, forks)
 
 	return command.TransactionPersistenceOutcome{
 		TransactionStatus: transactionStatus,
@@ -299,9 +305,11 @@ func (store *Store) PersistBulkWithOutcome(ctx context.Context, records []comman
 		}
 	}
 
+	forks := map[*operation.Operation]string{}
+
 	for _, index := range ordered {
 		for _, row := range records[index].Transaction.Operations {
-			if err := verifyOperation(ctx, querier, row); err != nil {
+			if err := verifyOperation(ctx, querier, row, forks); err != nil {
 				return nil, err
 			}
 		}
@@ -316,6 +324,8 @@ func (store *Store) PersistBulkWithOutcome(ctx context.Context, records []comman
 	}
 
 	committed = true
+
+	store.reportForks(ctx, forks)
 
 	for index, record := range records {
 		outcomes[index] = command.TransactionPersistenceOutcome{
@@ -704,7 +714,8 @@ func verifyTransaction(ctx context.Context, querier repository.DBQuerier, record
 	return status, true, nil
 }
 
-func verifyOperation(ctx context.Context, querier repository.DBQuerier, row *operation.Operation) error {
+// verifyOperation maps the row to another live operation that recorded its balance version, if any.
+func verifyOperation(ctx context.Context, querier repository.DBQuerier, row *operation.Operation, forks map[*operation.Operation]string) error {
 	// recorded_at is intentionally excluded: rolling-upgrade records and legacy
 	// projections may be stamped by the repository fallback at different times.
 	columns := []string{"transaction_id", "description", "type", "asset_code", "amount", "available_balance", "on_hold_balance", "available_balance_after", "on_hold_balance_after", "status", "status_description", "account_id", "account_alias", "balance_id", "chart_of_accounts", "organization_id", "ledger_id", "created_at", "updated_at", "deleted_at", "route", "balance_affected", "balance_key", "balance_version_before", "balance_version_after", "direction", "route_id", "route_code", "route_description"}
@@ -731,7 +742,7 @@ func verifyOperation(ctx context.Context, querier repository.DBQuerier, row *ope
 	args = append(args, string(snapshot))
 	predicate := equalityPredicate(columns, 2) + fmt.Sprintf(" AND snapshot IS NOT DISTINCT FROM $%d::jsonb", len(args))
 
-	rows, err := querier.QueryContext(ctx, "SELECT ("+predicate+") FROM operation WHERE id = $1 FOR SHARE", args...)
+	rows, err := querier.QueryContext(ctx, "SELECT ("+predicate+"), "+forkTwinColumn+" FROM operation WHERE id = $1 FOR SHARE", args...)
 	if err != nil {
 		return fmt.Errorf("read recovery operation: %w", err)
 	}
@@ -747,7 +758,9 @@ func verifyOperation(ctx context.Context, querier repository.DBQuerier, row *ope
 	}
 
 	var matches bool
-	if err := rows.Scan(&matches); err != nil {
+
+	var twin *string
+	if err := rows.Scan(&matches, &twin); err != nil {
 		return fmt.Errorf("decode recovery operation: %w", err)
 	}
 
@@ -757,6 +770,10 @@ func verifyOperation(ctx context.Context, querier repository.DBQuerier, row *ope
 
 	if !matches {
 		return conflict("persisted operation differs from frozen row")
+	}
+
+	if twin != nil {
+		forks[row] = *twin
 	}
 
 	return nil

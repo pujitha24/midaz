@@ -18,6 +18,7 @@ import (
 	tmmongo "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/mongo"
 	tmpostgres "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/postgres"
 	tmrabbitmq "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/rabbitmq"
+	libObservability "github.com/LerianStudio/lib-observability/v4"
 	libLog "github.com/LerianStudio/lib-observability/v4/log"
 	"github.com/LerianStudio/lib-observability/v4/metrics"
 	libOpentelemetry "github.com/LerianStudio/lib-observability/v4/tracing"
@@ -216,7 +217,7 @@ func initMultiTenantRabbitMQ(
 		if err := consumer.Register(
 			queueName,
 			func(ctx context.Context, delivery amqp.Delivery) error {
-				ctx, err := resolveTenantConnections(ctx, rmqComponents)
+				ctx, err := resolveTenantConnections(libObservability.ContextWithLogger(ctx, logger), rmqComponents)
 				if err != nil {
 					logger.Log(ctx, libLog.LevelError, "Failed to resolve tenant connections for consumer message", libLog.Err(err))
 					return err

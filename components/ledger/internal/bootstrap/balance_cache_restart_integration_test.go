@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -62,7 +61,6 @@ import (
 	transactionRedis "github.com/LerianStudio/midaz/v4/components/ledger/internal/adapters/redis/transaction"
 	"github.com/LerianStudio/midaz/v4/components/ledger/internal/services/command"
 	"github.com/LerianStudio/midaz/v4/components/ledger/internal/services/query"
-	"github.com/LerianStudio/midaz/v4/pkg/mmodel"
 	"github.com/LerianStudio/midaz/v4/pkg/utils"
 	testutils "github.com/LerianStudio/midaz/v4/tests/utils"
 	"github.com/LerianStudio/midaz/v4/tests/utils/chaos"
@@ -72,8 +70,8 @@ import (
 )
 
 // TestIntegrationBalanceCacheRestartFromOlderState posts transfers on the real create path, SIGKILLs and
-// restarts a dedicated Valkey, posts again, and requires each balance, in PostgreSQL and in the cache, to
-// equal its opening plus its operations' deltas, with one operation per balance version.
+// restarts a dedicated Valkey and posts again. A restart that loses no write keeps each balance equal to its
+// operations; one that comes back older forks it, and the completer must report every forked operation.
 func TestIntegrationBalanceCacheRestartFromOlderState(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires PostgreSQL, MongoDB and a dedicated Valkey")
@@ -88,7 +86,6 @@ func TestIntegrationBalanceCacheRestartFromOlderState(t *testing.T) {
 		h.transfer(t, 20)
 		h.waitSynced(t) // the snapshot then holds no sync claim lock
 		require.NoError(t, h.redis.Save(context.Background()).Err())
-		t.Log("snapshot taken (SAVE)")
 
 		for _, amount := range []int64{30, 40, 50} {
 			h.transfer(t, amount)
@@ -100,10 +97,10 @@ func TestIntegrationBalanceCacheRestartFromOlderState(t *testing.T) {
 		for _, amount := range []int64{60, 70, 80, 90} {
 			h.transfer(t, amount)
 			h.waitSynced(t)
-			h.logReconciler(t)
 		}
 
-		h.verifyTrail(t)
+		forked := h.verifyTrail(t, true)
+		assert.Equal(t, forked, h.detectedForks(t), "every forked operation is reported once, naming the operation that first recorded its version")
 	})
 
 	t.Run("aof-everysec-sigkill", func(t *testing.T) {
@@ -124,10 +121,10 @@ func TestIntegrationBalanceCacheRestartFromOlderState(t *testing.T) {
 		for _, amount := range []int64{60, 70, 80, 90} {
 			h.transfer(t, amount)
 			h.waitSynced(t)
-			h.logReconciler(t)
 		}
 
-		h.verifyTrail(t)
+		assert.Empty(t, h.verifyTrail(t, false))
+		assert.Empty(t, h.detectedForks(t), "no fork, no report")
 	})
 }
 
@@ -170,6 +167,7 @@ func (s restartState) equal(other restartState) bool {
 }
 
 type restartOperation struct {
+	id            uuid.UUID
 	order         int
 	transactionID uuid.UUID
 	before, after restartState
@@ -230,6 +228,7 @@ func newBalanceCacheRestartHarness(t *testing.T, valkeyArgs ...string) *balanceC
 
 	logger := &cleanupCapturingLogger{Logger: libLog.NewNop()}
 	reader, factory := newBalanceSyncReaderFactory(t)
+	commandUseCase.MetricsFactory = factory
 	require.NoError(t, configureAppliedTransactionCompletion(NewRedisQueueConsumer(logger, commandUseCase, queryUseCase), commandUseCase, false, nil, nil))
 	require.NoError(t, configureEngine(commandUseCase, integrationEngineClientProvider{client: redisClient}))
 
@@ -247,10 +246,6 @@ func newBalanceCacheRestartHarness(t *testing.T, valkeyArgs ...string) *balanceC
 		},
 	}
 	h.app = h.newApp()
-
-	config := redisClient.ConfigGet(context.Background(), "*").Val()
-	t.Logf("valkey %s: appendonly=%s appendfsync=%s save=%q maxmemory-policy=%s", addr, config["appendonly"], config["appendfsync"], config["save"], config["maxmemory-policy"])
-
 	h.startSync(t)
 
 	return h
@@ -357,49 +352,14 @@ func (h *balanceCacheRestartHarness) transfer(t *testing.T, amount int64) {
 	request.Header.Set("X-Idempotency", "cache-restart-"+uuid.NewString())
 	response := performEngineWriteBehindHTTPRequest(t, h.app, request)
 
-	label := fmt.Sprintf("T%d", len(h.posted)+1)
-	if !assert.Equalf(t, http.StatusCreated, response.status, "%s transfer %d: %s", label, amount, response.body) {
-		return
-	}
+	require.Equalf(t, http.StatusCreated, response.status, "transfer %d: %s", amount, response.body)
 
 	var created struct {
-		ID         uuid.UUID              `json:"id"`
-		Operations []*operation.Operation `json:"operations"`
+		ID uuid.UUID `json:"id"`
 	}
 
 	require.NoError(t, json.Unmarshal(response.body, &created))
-
-	legs := make([]string, 0, len(created.Operations))
-	for _, op := range created.Operations {
-		legs = append(legs, fmt.Sprintf("%s %s %s -> %s", op.AccountAlias, op.Type, restartLeg(op.Balance), restartLeg(op.BalanceAfter)))
-	}
-
-	t.Logf("%s POST transfer %d -> HTTP %d: %s", label, amount, response.status, strings.Join(legs, "; "))
 	h.posted = append(h.posted, created.ID)
-	h.logReads(t, "after "+label)
-}
-
-func restartLeg(b operation.Balance) string {
-	if b.Available == nil || b.OnHold == nil || b.Version == nil {
-		return "<missing>"
-	}
-
-	return restartState{available: *b.Available, onHold: *b.OnHold, version: *b.Version}.String()
-}
-
-func (h *balanceCacheRestartHarness) logReads(t *testing.T, label string) {
-	t.Helper()
-
-	for _, b := range h.balances {
-		path := "/v1/organizations/" + h.orgID.String() + "/ledgers/" + h.ledgerID.String() + "/balances/" + b.id.String()
-		response := performEngineWriteBehindHTTPRequest(t, h.app, httptest.NewRequest(http.MethodGet, path, nil))
-
-		var read mmodel.Balance
-
-		_ = json.Unmarshal(response.body, &read)
-		t.Logf("%s: GET %s balance -> HTTP %d, available %s onHold %s version %d", label, b.alias, response.status, read.Available, read.OnHold, read.Version)
-		assert.Equalf(t, http.StatusOK, response.status, "balance read: %s", response.body)
-	}
 }
 
 func (h *balanceCacheRestartHarness) cacheKey(b restartBalance) string {
@@ -423,15 +383,6 @@ func (h *balanceCacheRestartHarness) live(b restartBalance) (restartState, error
 	return restartState{available: cached.Available, onHold: cached.OnHold, version: cached.Version}, nil
 }
 
-func (h *balanceCacheRestartHarness) logStates(t *testing.T, label string, read func(restartBalance) (restartState, error)) {
-	t.Helper()
-
-	for _, b := range h.balances {
-		state, err := read(b)
-		t.Logf("%s: %s %s (err: %v)", label, b.alias, state, err)
-	}
-}
-
 // waitSynced returns once the balance sync worker removed every balance of the
 // pair from the schedule, which it does after its PostgreSQL write returns.
 func (h *balanceCacheRestartHarness) waitSynced(t *testing.T) {
@@ -446,7 +397,6 @@ func (h *balanceCacheRestartHarness) waitSynced(t *testing.T) {
 
 		return true
 	}, 30*time.Second, 50*time.Millisecond, "the balance sync worker must process every scheduled balance")
-	h.logStates(t, "PostgreSQL row after the sync worker ran", h.row)
 }
 
 func (h *balanceCacheRestartHarness) waitRowVersion(t *testing.T, version int64) {
@@ -461,16 +411,12 @@ func (h *balanceCacheRestartHarness) waitRowVersion(t *testing.T, version int64)
 
 		return true
 	}, 30*time.Second, 50*time.Millisecond, "the balance sync worker must persist version %d", version)
-	h.logStates(t, "PostgreSQL row", h.row)
 }
 
 func (h *balanceCacheRestartHarness) restartValkey(t *testing.T) {
 	t.Helper()
 
 	ctx := context.Background()
-	keys := h.redis.DBSize(ctx).Val()
-	h.logStates(t, "live cache before SIGKILL", h.live)
-
 	orchestrator := chaos.NewOrchestrator(t)
 	defer func() { _ = orchestrator.Close() }()
 
@@ -490,65 +436,12 @@ func (h *balanceCacheRestartHarness) restartValkey(t *testing.T) {
 
 		return err == nil && shared.Ping(ctx).Err() == nil && h.redis.Ping(ctx).Err() == nil
 	}, 30*time.Second, 100*time.Millisecond, "the ledger's Valkey clients must reconnect")
-
-	var persistence []string
-
-	for _, line := range strings.Split(h.redis.Info(ctx, "persistence").Val(), "\r\n") {
-		if strings.HasPrefix(line, "aof_enabled:") || strings.HasPrefix(line, "rdb_last_load_keys_loaded:") {
-			persistence = append(persistence, line)
-		}
-	}
-
-	t.Logf("valkey SIGKILLed and started again: %d keys before the kill, %d after; %s", keys, h.redis.DBSize(ctx).Val(), strings.Join(persistence, " "))
-
-	logs, err := h.valkey.Logs(ctx)
-	require.NoError(t, err)
-
-	raw, err := io.ReadAll(logs)
-	require.NoError(t, err)
-	require.NoError(t, logs.Close())
-
-	for _, line := range strings.Split(string(raw), "\n") {
-		if lower := strings.ToLower(line); strings.Contains(lower, "load") || strings.Contains(lower, "aof") || strings.Contains(lower, "truncat") {
-			t.Logf("valkey log: %s", strings.TrimSpace(line))
-		}
-	}
-
-	h.logStates(t, "live cache after restart", h.live)
-	h.logReads(t, "after restart")
 }
 
-func (h *balanceCacheRestartHarness) logReconciler(t *testing.T) {
-	t.Helper()
-
-	pairs, _, err := h.query.ReconcileBalancesPage(context.Background(), uuid.Nil, 10)
-	require.NoError(t, err)
-
-	now := time.Now()
-
-	for _, pair := range pairs {
-		alias := pair.BalanceID.String()
-
-		for _, b := range h.balances {
-			if b.id == pair.BalanceID {
-				alias = b.alias
-			}
-		}
-
-		head := "no trail"
-		if pair.Trail != nil {
-			head = fmt.Sprintf("trail head %s/%s v%d", pair.Trail.Available, pair.Trail.OnHold, pair.Trail.Version)
-		}
-
-		t.Logf("balance reconciler: %s row %s/%s v%d vs %s -> %s with no grace, %s with the default grace",
-			alias, pair.Available, pair.OnHold, pair.Version, head,
-			query.ClassifyBalanceTrailPair(pair, now, 0), query.ClassifyBalanceTrailPair(pair, now, defaultBalanceReconcilerGraceMs*time.Millisecond))
-	}
-}
-
-// verifyTrail checks each balance against the operations PostgreSQL holds for it,
-// in the order the transfers were confirmed.
-func (h *balanceCacheRestartHarness) verifyTrail(t *testing.T) {
+// verifyTrail checks each balance against the operations PostgreSQL holds for it, in the order the
+// transfers were confirmed, and returns each operation that recorded a version an earlier one had, mapped
+// to that earlier one. Without a fork every balance must equal its opening plus its operations' deltas.
+func (h *balanceCacheRestartHarness) verifyTrail(t *testing.T, expectFork bool) map[uuid.UUID]uuid.UUID {
 	t.Helper()
 
 	order := make(map[uuid.UUID]int, len(h.posted))
@@ -556,16 +449,25 @@ func (h *balanceCacheRestartHarness) verifyTrail(t *testing.T) {
 		order[id] = i + 1
 	}
 
+	reused := map[uuid.UUID]uuid.UUID{}
+
 	for _, b := range h.balances {
 		expected := restartState{available: b.opening, onHold: decimal.Zero}
 		previous := expected
-		versions := map[int64]int{}
+		first := map[int64]uuid.UUID{}
 
 		var breaks []string
 
-		operations := h.trail(t, b, order)
-		for _, op := range operations {
-			t.Logf("operation trail %s: T%d %s -> %s", b.alias, op.order, op.before, op.after)
+		for _, op := range h.trail(t, b, order) {
+			if original, seen := first[op.after.version]; seen {
+				reused[op.id] = original
+			} else {
+				first[op.after.version] = op.id
+			}
+
+			if expectFork {
+				continue
+			}
 
 			switch {
 			case op.before.version < previous.version:
@@ -579,42 +481,51 @@ func (h *balanceCacheRestartHarness) verifyTrail(t *testing.T) {
 			expected.available = expected.available.Add(op.after.available.Sub(op.before.available))
 			expected.onHold = expected.onHold.Add(op.after.onHold.Sub(op.before.onHold))
 			expected.version = max(expected.version, op.after.version)
-			versions[op.after.version]++
 			previous = op.after
 		}
 
-		var duplicated []int64
+		if !expectFork {
+			row, err := h.row(b)
+			require.NoError(t, err)
 
-		for version, count := range versions {
-			if count > 1 {
-				duplicated = append(duplicated, version)
-			}
+			live, err := h.live(b)
+			require.NoError(t, err)
+
+			assert.Truef(t, row.equal(expected), "%s: PostgreSQL balance %s differs from opening + operation deltas %s", b.alias, row, expected)
+			assert.Truef(t, live.equal(expected), "%s: live cache balance %s differs from opening + operation deltas %s", b.alias, live, expected)
+			assert.Emptyf(t, breaks, "%s: operations that do not start where the previous one ended", b.alias)
 		}
-
-		slices.Sort(duplicated)
-
-		row, err := h.row(b)
-		require.NoError(t, err)
-
-		live, err := h.live(b)
-		require.NoError(t, err)
-
-		t.Logf("%s: opening %s + deltas of %d operations = %s | PostgreSQL row %s | live cache %s | versions recorded twice %v",
-			b.alias, b.opening, len(operations), expected, row, live, duplicated)
-		assert.Truef(t, row.equal(expected), "%s: PostgreSQL balance %s differs from opening + operation deltas %s", b.alias, row, expected)
-		assert.Truef(t, live.equal(expected), "%s: live cache balance %s differs from opening + operation deltas %s", b.alias, live, expected)
-		assert.Emptyf(t, duplicated, "%s: balance versions recorded by more than one operation", b.alias)
-		assert.Emptyf(t, breaks, "%s: operations that do not start where the previous one ended", b.alias)
 	}
 
-	h.logReconciler(t)
-	h.logSignals(t)
+	if expectFork {
+		require.NotEmpty(t, reused, "the restart must have forked the balances for the detector to have something to report")
+	}
+
+	return reused
+}
+
+// detectedForks returns the forked operations the completer logged, mapped to the twin each named,
+// and requires the fork counter to count each report once.
+func (h *balanceCacheRestartHarness) detectedForks(t *testing.T) map[uuid.UUID]uuid.UUID {
+	t.Helper()
+
+	detected := map[uuid.UUID]uuid.UUID{}
+
+	for _, entry := range h.logger.at(libLog.LevelError) {
+		if twin, ok := entry.fields["twin_operation_id"]; ok {
+			detected[uuid.MustParse(fmt.Sprint(entry.fields["operation_id"]))] = uuid.MustParse(fmt.Sprint(twin))
+		}
+	}
+
+	assert.Equal(t, int64(len(detected)), h.counters(t)[utils.BalanceVersionForked.Name], "%s counts each logged fork once", utils.BalanceVersionForked.Name)
+
+	return detected
 }
 
 func (h *balanceCacheRestartHarness) trail(t *testing.T, b restartBalance, order map[uuid.UUID]int) []restartOperation {
 	t.Helper()
 
-	rows, err := h.db.Query(`SELECT transaction_id, available_balance, on_hold_balance, balance_version_before,
+	rows, err := h.db.Query(`SELECT id, transaction_id, available_balance, on_hold_balance, balance_version_before,
 		available_balance_after, on_hold_balance_after, balance_version_after
 		FROM operation WHERE balance_id = $1 AND deleted_at IS NULL AND balance_affected`, b.id)
 	require.NoError(t, err)
@@ -625,7 +536,7 @@ func (h *balanceCacheRestartHarness) trail(t *testing.T, b restartBalance, order
 
 	for rows.Next() {
 		var op restartOperation
-		require.NoError(t, rows.Scan(&op.transactionID, &op.before.available, &op.before.onHold, &op.before.version,
+		require.NoError(t, rows.Scan(&op.id, &op.transactionID, &op.before.available, &op.before.onHold, &op.before.version,
 			&op.after.available, &op.after.onHold, &op.after.version))
 		op.order = order[op.transactionID]
 		operations = append(operations, op)
@@ -637,63 +548,25 @@ func (h *balanceCacheRestartHarness) trail(t *testing.T, b restartBalance, order
 	return operations
 }
 
-// logSignals prints what an operator would have seen: every warning and error
-// the run logged, the sync writes skipped by the version guard, and the metrics.
-func (h *balanceCacheRestartHarness) logSignals(t *testing.T) {
+// counters sums every int64 counter the run emitted, by metric name.
+func (h *balanceCacheRestartHarness) counters(t *testing.T) map[string]int64 {
 	t.Helper()
-
-	counts := map[string]int{}
-	samples := map[string]map[string]any{}
-	skipped := 0
-
-	var keys []string
-
-	h.logger.mu.Lock()
-	t.Logf("captured %d log entries at every level; warnings and errors follow", len(h.logger.entries))
-
-	for _, entry := range h.logger.entries {
-		if entry.msg == "UpdateMany completed" && fmt.Sprint(entry.fields["updated"]) != fmt.Sprint(entry.fields["total"]) {
-			skipped++
-		}
-
-		if entry.level > libLog.LevelWarn {
-			continue
-		}
-
-		key := fmt.Sprintf("level %d: %s", entry.level, entry.msg)
-		if counts[key] == 0 {
-			keys = append(keys, key)
-			samples[key] = entry.fields
-		}
-
-		counts[key]++
-	}
-	h.logger.mu.Unlock()
-
-	for _, key := range keys {
-		t.Logf("logged %s (x%d), first fields %v", key, counts[key], samples[key])
-	}
-
-	t.Logf("balance sync writes that updated fewer rows than they carried (Debug only): %d", skipped)
 
 	var collected metricdata.ResourceMetrics
 
 	require.NoError(t, h.reader.Collect(context.Background(), &collected))
 
+	totals := map[string]int64{}
+
 	for _, scope := range collected.ScopeMetrics {
 		for _, m := range scope.Metrics {
 			if sum, ok := m.Data.(metricdata.Sum[int64]); ok {
-				total := int64(0)
 				for _, point := range sum.DataPoints {
-					total += point.Value
+					totals[m.Name] += point.Value
 				}
-
-				t.Logf("metric %s = %d", m.Name, total)
-
-				continue
 			}
-
-			t.Logf("metric %s (%T)", m.Name, m.Data)
 		}
 	}
+
+	return totals
 }

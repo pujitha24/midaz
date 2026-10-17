@@ -15,9 +15,14 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	libObservability "github.com/LerianStudio/lib-observability/v4"
+	libLog "github.com/LerianStudio/lib-observability/v4/log"
+	"github.com/LerianStudio/lib-observability/v4/metrics"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/LerianStudio/midaz/v4/components/ledger/internal/adapters/postgres/operation"
 	"github.com/LerianStudio/midaz/v4/components/ledger/internal/adapters/postgres/transaction"
@@ -26,6 +31,7 @@ import (
 	"github.com/LerianStudio/midaz/v4/pkg/mmodel"
 	"github.com/LerianStudio/midaz/v4/pkg/mtransaction"
 	"github.com/LerianStudio/midaz/v4/pkg/repository"
+	"github.com/LerianStudio/midaz/v4/pkg/utils"
 )
 
 type transactionStoreStub struct {
@@ -113,7 +119,7 @@ func expectOperations(mock sqlmock.Sqlmock, count int) {
 
 func expectVerifiedOperations(mock sqlmock.Sqlmock, count int) {
 	for range count {
-		mock.ExpectQuery(`SELECT .* FROM operation WHERE id = \$1 FOR SHARE`).WillReturnRows(sqlmock.NewRows([]string{"matches"}).AddRow(true)).RowsWillBeClosed()
+		mock.ExpectQuery(`SELECT .* FROM operation WHERE id = \$1 FOR SHARE`).WillReturnRows(sqlmock.NewRows([]string{"matches", "twin"}).AddRow(true, nil)).RowsWillBeClosed()
 	}
 }
 
@@ -160,7 +166,7 @@ func TestStorePersistCreationRaceDoesNotAppendAnotherExecution(t *testing.T) {
 				return
 			}
 
-			mock.ExpectQuery("SELECT .* FROM operation").WillReturnRows(sqlmock.NewRows([]string{"matches"}))
+			mock.ExpectQuery("SELECT .* FROM operation").WillReturnRows(sqlmock.NewRows([]string{"matches", "twin"}))
 			mock.ExpectRollback()
 			require.ErrorIs(t, store.Persist(context.Background(), frozenStoreRecord()), command.ErrTransactionCompletionConflict)
 		})
@@ -336,9 +342,9 @@ func TestStorePersistLateHoldRequiresEveryFrozenRow(t *testing.T) {
 				mock.ExpectBegin()
 				expectTransaction(mock, status, true, true)
 				expectVerifiedOperations(mock, 1)
-				rows := sqlmock.NewRows([]string{"matches"})
+				rows := sqlmock.NewRows([]string{"matches", "twin"})
 				if proof != "missing" {
-					rows.AddRow(proof == "matching")
+					rows.AddRow(proof == "matching", nil)
 				}
 				mock.ExpectQuery(`SELECT .* FROM operation WHERE id = \$1 FOR SHARE`).WillReturnRows(rows).RowsWillBeClosed()
 				if proof == "matching" {
@@ -369,9 +375,9 @@ func TestStorePersistRejectsDivergentRows(t *testing.T) {
 			mock.ExpectBegin()
 			expectTransaction(mock, constant.APPROVED, scenario.active, scenario.matchingTx)
 			if scenario.operation {
-				rows := sqlmock.NewRows([]string{"matches"})
+				rows := sqlmock.NewRows([]string{"matches", "twin"})
 				if !scenario.missingRow {
-					rows.AddRow(false)
+					rows.AddRow(false, nil)
 				}
 
 				mock.ExpectQuery(`SELECT .* FROM operation`).WillReturnRows(rows)
@@ -517,8 +523,94 @@ func TestVerifyOperationAllPersistedFields(t *testing.T) {
 		row.AccountID, "@source", row.BalanceID, "", row.OrganizationID, row.LedgerID, row.CreatedAt, row.UpdatedAt, nil, nil, true, "default",
 		int64(9007199254740993), int64(9007199254740994), constant.DirectionDebit, "", "", "", string(snapshot),
 	}
-	mock.ExpectQuery(`SELECT .*balance_version_before IS NOT DISTINCT FROM \$25 AND balance_version_after IS NOT DISTINCT FROM \$26.*` + regexp.QuoteMeta("snapshot IS NOT DISTINCT FROM $31::jsonb) FROM operation WHERE id = $1 FOR SHARE")).
-		WithArgs(args...).WillReturnRows(sqlmock.NewRows([]string{"matches"}).AddRow(true))
-	require.NoError(t, verifyOperation(context.Background(), db, row))
+	mock.ExpectQuery(`SELECT .*balance_version_before IS NOT DISTINCT FROM \$25 AND balance_version_after IS NOT DISTINCT FROM \$26.*` + regexp.QuoteMeta("snapshot IS NOT DISTINCT FROM $31::jsonb), (SELECT twin.id FROM operation twin") + `.*` + regexp.QuoteMeta("LIMIT 1) FROM operation WHERE id = $1 FOR SHARE")).
+		WithArgs(args...).WillReturnRows(sqlmock.NewRows([]string{"matches", "twin"}).AddRow(true, nil))
+	require.NoError(t, verifyOperation(context.Background(), db, row, map[*operation.Operation]string{}))
 	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+type forkLogger struct {
+	libLog.Logger
+	errors []map[string]any
+}
+
+func (logger *forkLogger) Log(_ context.Context, level int, _ string, fields ...any) {
+	if level != libLog.LevelError {
+		return
+	}
+
+	entry := map[string]any{}
+	for _, field := range fields {
+		if typed, ok := field.(libLog.Field); ok {
+			entry[typed.Key] = typed.Value
+		}
+	}
+
+	logger.errors = append(logger.errors, entry)
+}
+
+func TestStorePersistReportsForkedBalanceVersionAfterCommit(t *testing.T) {
+	const twinID = "88888888-8888-5888-8888-888888888888"
+
+	for _, scenario := range []struct {
+		name      string
+		twin      any
+		commitErr error
+		reported  bool
+	}{
+		{"twin found", twinID, nil, true},
+		{"no twin", nil, nil, false},
+		{"commit failure", twinID, errors.New("commit failure"), false},
+	} {
+		t.Run(scenario.name, func(t *testing.T) {
+			store, mock := newStoreTest(t)
+			reader := sdkmetric.NewManualReader()
+			factory, err := metrics.NewMetricsFactory(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("completion-test"), nil)
+			require.NoError(t, err)
+
+			logger := &forkLogger{Logger: libLog.NewNop()}
+			record := frozenStoreRecord()
+			row := record.Transaction.Operations[0]
+
+			mock.ExpectBegin()
+			expectTransaction(mock, constant.APPROVED, true, true)
+			mock.ExpectQuery(regexp.QuoteMeta("twin.balance_version_after = operation.balance_version_after")).
+				WillReturnRows(sqlmock.NewRows([]string{"matches", "twin"}).AddRow(true, scenario.twin)).RowsWillBeClosed()
+			mock.ExpectCommit().WillReturnError(scenario.commitErr)
+
+			err = store.WithMetricsFactory(factory).Persist(libObservability.ContextWithLogger(t.Context(), logger), record)
+			require.ErrorIs(t, err, scenario.commitErr)
+
+			var collected metricdata.ResourceMetrics
+
+			require.NoError(t, reader.Collect(t.Context(), &collected))
+
+			forked := int64(0)
+
+			for _, scope := range collected.ScopeMetrics {
+				for _, metric := range scope.Metrics {
+					if metric.Name == utils.BalanceVersionForked.Name {
+						for _, point := range metric.Data.(metricdata.Sum[int64]).DataPoints {
+							forked += point.Value
+							organization, _ := point.Attributes.Value("organization_id")
+							assert.Equal(t, row.OrganizationID, organization.AsString())
+						}
+					}
+				}
+			}
+
+			if !scenario.reported {
+				assert.Zero(t, forked)
+				assert.Empty(t, logger.errors)
+
+				return
+			}
+
+			assert.Equal(t, int64(1), forked)
+			require.Len(t, logger.errors, 1)
+			assert.Equal(t, row.ID, logger.errors[0]["operation_id"])
+			assert.Equal(t, twinID, logger.errors[0]["twin_operation_id"])
+			assert.Equal(t, row.BalanceID, logger.errors[0]["balance_id"])
+		})
+	}
 }
