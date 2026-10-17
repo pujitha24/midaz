@@ -929,7 +929,8 @@ version when the second of the two operations completes, as
 two operations that complete concurrently can both go unreported. Any non-zero
 value is a fork for an operator to resolve: alert on
 `balance_version_forked_total > 0`, since the series appears on the first fork
-and `increase()` misses it. The check runs in every transaction completion and
+and `increase()` misses it. The counter resets on a pod restart, so the Error log
+(`twin_operation_id`) is the record to act on. The check runs in every transaction completion and
 needs `idx_operation_balance_version` valid in every tenant schema; without it
 every completion scans the account's operation trail. Migration `000046` builds
 it `CONCURRENTLY`, so an interrupted build leaves it invalid and a re-run skips
