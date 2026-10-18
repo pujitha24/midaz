@@ -193,23 +193,22 @@ var (
 	}
 
 	// ConfigKeyReloaded counts configurations reloaded from the PostgreSQL primary
-	// before an engine execution because their configuration key was absent, by
-	// family (balance|account). Absence is normal after a deploy and on every expiry
-	// of the fixed one-hour key lifetime, so the rate is the database cost of that
-	// lifetime.
+	// before an engine execution, by family (balance|account), because their key was
+	// absent (after a deploy and on every expiry of the one-hour key lifetime) or its
+	// content differed from a cached balance's blob copy (a change an earlier release
+	// served, or a copy stale against PostgreSQL, which reloads on every load).
 	ConfigKeyReloaded = metrics.Metric{
 		Name:        "config_key_reloaded_total",
 		Unit:        "1",
-		Description: "Total balance and account configurations reloaded from the primary database because their configuration key was absent.",
+		Description: "Total balance and account configurations reloaded from the primary database because their configuration key was absent or differed from a cached balance's blob copy.",
 	}
 
 	// ConfigCopyDivergent counts configurations loaded for an engine execution whose
 	// copy (the blob's, or the row's on a cache miss) carries the version the engine
 	// decides with but other content, by family (balance|account). The engine decides
 	// with the configuration key and keeps the blob's copy, so nothing fails; a
-	// nonzero rate means a release that reads the configuration from the blob changed
-	// it without a version (expected only while earlier pods serve PATCHes), a copy
-	// that diverged before versions existed, or versions moved back.
+	// nonzero rate means a copy that diverged before versions existed, or versions
+	// moved back. A change an earlier release served reloads under its newer version.
 	ConfigCopyDivergent = metrics.Metric{
 		Name:        "config_copy_divergent_total",
 		Unit:        "1",
