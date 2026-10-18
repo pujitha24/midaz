@@ -1479,10 +1479,13 @@ agrees with the older key:
 - A current pod seeded the balance from a replica that had not applied the change
   yet (balance configuration only; the account row is read from the primary).
 
-Once the last earlier-release pod is gone, delete every configuration key
-(`account-config` and `balance-config`, under any tenant prefix): each next load
-reloads them from the primary, which ends this exposure at the rollout instead
-of an hour later.
+Once the last earlier-release pod is gone, restart the ledger and wait until no
+pod that ran next to an earlier-release pod is left. Then delete every
+configuration key (`account-config` and `balance-config`, under any tenant
+prefix): each next load reloads them from the primary, which ends this exposure
+at the rollout instead of an hour later. The restart comes first because a load
+in flight writes the rows it read before the earlier pod's last PATCH back as a
+missing key; only a process that exited before the deletion cannot.
 
 Current pods never undo that change in the blob: they never write the
 configuration copy of a blob that exists, whatever its version fields say. A
