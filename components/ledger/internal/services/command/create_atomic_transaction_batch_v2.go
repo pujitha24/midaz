@@ -468,7 +468,7 @@ func (uc *UseCase) prepareAtomicTransactionBatchItem(
 	// account on both sides; every other item keeps the shared-account rule.
 	var validateOpts []mtransaction.ValidateOption
 	if item.action == constant.ActionRevert {
-		validateOpts = append(validateOpts, mtransaction.ForReversal())
+		validateOpts = append(validateOpts, mtransaction.ForStoredSend())
 	}
 
 	if _, err := mtransaction.ValidateSendSourceAndDistribute(ctx, item.input, item.status, validateOpts...); err != nil {

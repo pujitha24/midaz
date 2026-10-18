@@ -254,7 +254,9 @@ func (uc *UseCase) preparePendingEngineIntent(ctx context.Context, run *pendingT
 	mtransaction.MutateConcatAliases(input.Send.Source.From)
 	mtransaction.MutateConcatAliases(input.Send.Distribute.To)
 
-	validate, err := mtransaction.ValidateSendSourceAndDistribute(ctx, input, run.status)
+	// The body is the stored hold, validated when it was created; a hold an earlier
+	// build accepted with one account on both sides must stay committable and cancellable.
+	validate, err := mtransaction.ValidateSendSourceAndDistribute(ctx, input, run.status, mtransaction.ForStoredSend())
 	if err != nil {
 		return pendingEngineTransition{}, pkg.HandleKnownBusinessValidationErrors(err)
 	}

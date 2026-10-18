@@ -448,18 +448,18 @@ func AppendIfNotExist(slice []string, s []string) []string {
 // validateConfig holds the optional behaviour ValidateSendSourceAndDistribute
 // accepts through ValidateOption.
 type validateConfig struct {
-	reversal bool
+	storedSend bool
 }
 
 // ValidateOption adjusts how ValidateSendSourceAndDistribute validates a send.
 type ValidateOption func(*validateConfig)
 
-// ForReversal marks the send as the reversal of a transaction that already
-// settled, which lifts the shared-account (ambiguity) check and nothing else.
-// New sends never pass this option.
-func ForReversal() ValidateOption {
+// ForStoredSend marks the send as rebuilt from a stored record (a reversal, a hold
+// commit), which lifts the shared-account (ambiguity) check and nothing else. A send
+// built from a request never passes this option.
+func ForStoredSend() ValidateOption {
 	return func(cfg *validateConfig) {
-		cfg.reversal = true
+		cfg.storedSend = true
 	}
 }
 
@@ -477,10 +477,9 @@ func ForReversal() ValidateOption {
 //  2. Ambiguity check: the same account, identified by "alias#balanceKey", must
 //     not appear as both a source and a destination, whatever position each
 //     entry holds in its list. This prevents self-transfer loops that would be
-//     no-ops. A pending cancel (CANCELED) skips it: releasing a hold moves no value.
-//     A reversal (ForReversal) skips it too: the reversal is rebuilt from
-//     operations already persisted, so it must stay possible for a transaction
-//     recorded before this rule existed.
+//     no-ops. A send rebuilt from a stored record (ForStoredSend) skips it, so a
+//     transaction recorded before this rule existed stays reversible, committable
+//     and cancellable.
 //
 //  3. Remainder check: a "remaining" entry must resolve to a positive amount.
 //
@@ -583,12 +582,7 @@ func validateSendSourceAndDistribute(ctx context.Context, transaction Transactio
 	// the two lists are compared as sets: the position an entry holds in either
 	// list is irrelevant, and the same alias on different balance keys is not a
 	// collision.
-	//
-	// Cancelling a pending send only releases its hold and cannot move value between
-	// the two sides, so a body persisted before this rule existed stays cancellable.
-	// A reversal is rebuilt from operations already persisted, so it must stay
-	// possible for a transaction recorded before this rule existed.
-	if transactionType != pkgConstant.CANCELED && !cfg.reversal {
+	if !cfg.storedSend {
 		sources := make(map[string]struct{}, len(response.Sources))
 		for _, source := range response.Sources {
 			sources[source] = struct{}{}
