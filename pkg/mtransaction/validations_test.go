@@ -1871,76 +1871,12 @@ func TestValidateSendSourceAndDistribute_AmbiguityIsPositionAndFormIndependent(t
 	}
 }
 
-// TestValidateSendSourceAndDistribute_AmbiguityByStatus pins which pending transitions the
-// ambiguity check covers. A pending cancel only releases the hold, so a cross-side body that an
-// older build accepted must stay cancellable; committing the same body would settle a debit and
-// a credit on one account, so the commit is refused.
-func TestValidateSendSourceAndDistribute_AmbiguityByStatus(t *testing.T) {
-	t.Parallel()
-
-	ctx := differentialContext()
-
-	crossIndexPending := func() Transaction {
-		tx := sendOf("USD", 100,
-			[]FromTo{leg("@a", "", "USD", 100)},
-			[]FromTo{leg("@b", "", "USD", 60), leg("@a", "", "USD", 40)})
-		tx.Pending = true
-
-		return tx
-	}
-
-	tests := []struct {
-		name     string
-		status   string
-		wantCode string
-	}{
-		{name: "pending cancel releases the hold", status: pkgConstant.CANCELED},
-		{name: "pending commit is ambiguous", status: pkgConstant.APPROVED, wantCode: pkgConstant.ErrTransactionAmbiguous.Error()},
-	}
-
-	forms := []struct {
-		name      string
-		normalize bool
-	}{
-		{name: "raw"},
-		{name: "normalized", normalize: true},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			for _, form := range forms {
-				t.Run(form.name, func(t *testing.T) {
-					t.Parallel()
-
-					send := cloneSendLegs(crossIndexPending())
-					if form.normalize {
-						normalizeSendLegsLikeCreate(&send)
-					}
-
-					_, err := ValidateSendSourceAndDistribute(ctx, send, tc.status)
-
-					if tc.wantCode == "" {
-						require.NoError(t, err)
-
-						return
-					}
-
-					require.Error(t, err)
-					assert.Equal(t, tc.wantCode, codeFromError(err))
-				})
-			}
-		})
-	}
-}
-
-// TestValidateSendSourceAndDistribute_ForReversal pins the reversal option. A reversal is
+// TestValidateSendSourceAndDistribute_ForStoredSend pins the stored-send option on a reversal, which is
 // rebuilt from the operations of a transaction that already settled, so a transaction an older
 // build recorded with one account on both sides must stay reversible: its reversal body carries
 // that account on both sides too. The option lifts only the shared-account rule; every other
 // rule still answers, and a call without the option keeps refusing the same body.
-func TestValidateSendSourceAndDistribute_ForReversal(t *testing.T) {
+func TestValidateSendSourceAndDistribute_ForStoredSend(t *testing.T) {
 	t.Parallel()
 
 	ctx := differentialContext()
@@ -1964,9 +1900,9 @@ func TestValidateSendSourceAndDistribute_ForReversal(t *testing.T) {
 		opts     []ValidateOption
 		wantCode string
 	}{
-		{name: "reversal with the account on both sides is accepted", send: crossSideReversal, opts: []ValidateOption{ForReversal()}},
+		{name: "reversal with the account on both sides is accepted", send: crossSideReversal, opts: []ValidateOption{ForStoredSend()}},
 		{name: "same body without the option is ambiguous", send: crossSideReversal, wantCode: pkgConstant.ErrTransactionAmbiguous.Error()},
-		{name: "reversal still answers the totals check", send: mismatchedReversal, opts: []ValidateOption{ForReversal()}, wantCode: pkgConstant.ErrTransactionValueMismatch.Error()},
+		{name: "reversal still answers the totals check", send: mismatchedReversal, opts: []ValidateOption{ForStoredSend()}, wantCode: pkgConstant.ErrTransactionValueMismatch.Error()},
 	}
 
 	forms := []struct {

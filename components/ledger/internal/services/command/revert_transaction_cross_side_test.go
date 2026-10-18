@@ -92,33 +92,46 @@ func TestRevertTransaction_CrossSideOriginStaysReversible(t *testing.T) {
 	}
 }
 
-// TestCreateTransactionV2_CrossSideSendIsAmbiguous is the counterpart: the same shape
-// offered as a new send is refused before the balance read.
-func TestCreateTransactionV2_CrossSideSendIsAmbiguous(t *testing.T) {
-	uc, reader, redisRepo := newVersionUseCase(t, mmodel.LedgerSettings{})
+// TestCreateTransaction_CrossSideSendIsAmbiguous is the counterpart: the same shape
+// offered as a new send, direct or pending, is refused before the balance read.
+func TestCreateTransaction_CrossSideSendIsAmbiguous(t *testing.T) {
+	for _, tc := range []struct {
+		name, status string
+		v1           bool
+	}{{"v2 direct", constant.CREATED, false}, {"v2 pending", constant.PENDING, false}, {"v1 pending", constant.PENDING, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, reader, redisRepo := newVersionUseCase(t, mmodel.LedgerSettings{})
 
-	redisRepo.EXPECT().Del(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+			redisRepo.EXPECT().Del(gomock.Any(), gomock.Any()).Return(nil).Times(1)
 
-	_, _, err := uc.CreateTransactionV2(context.Background(), CreateTransactionV2Input{
-		OrganizationID:    uuid.New(),
-		LedgerID:          uuid.New(),
-		Transaction:       crossSideSend(),
-		TransactionStatus: constant.CREATED,
-		IdempotencyTTL:    time.Minute,
-	})
+			send := crossSideSend()
+			send.Pending = tc.status == constant.PENDING
 
-	require.Error(t, err)
+			var err error
+			if tc.v1 {
+				_, _, err = uc.CreateTransactionV1(context.Background(), CreateTransactionV1Input{
+					OrganizationID: uuid.New(), LedgerID: uuid.New(), Transaction: send, TransactionStatus: tc.status, IdempotencyTTL: time.Minute,
+				})
+			} else {
+				_, _, err = uc.CreateTransactionV2(context.Background(), CreateTransactionV2Input{
+					OrganizationID: uuid.New(), LedgerID: uuid.New(), Transaction: send, TransactionStatus: tc.status, IdempotencyTTL: time.Minute,
+				})
+			}
 
-	var business pkg.UnprocessableOperationError
+			require.Error(t, err)
 
-	require.ErrorAs(t, err, &business)
-	assert.Equal(t, constant.ErrTransactionAmbiguous.Error(), business.Code)
-	assert.Zero(t, reader.getBalancesCalls, "the refusal must precede the balance read")
+			var business pkg.UnprocessableOperationError
+
+			require.ErrorAs(t, err, &business)
+			assert.Equal(t, constant.ErrTransactionAmbiguous.Error(), business.Code)
+			assert.Zero(t, reader.getBalancesCalls, "the refusal must precede the balance read")
+		})
+	}
 }
 
 // TestAtomicTransactionBatchItem_CrossSideOnlyForRevert proves the batch item preparation
-// lifts the shared-account rule for a revert item alone: the same body as a direct item is
-// refused with the ambiguity code.
+// lifts the shared-account rule for a revert item alone: the same body as a direct or hold
+// item is refused with the ambiguity code.
 func TestAtomicTransactionBatchItem_CrossSideOnlyForRevert(t *testing.T) {
 	// The reversal of crossSideOrigin: @payee and @payer are debited, @payer is credited.
 	reversal := mtransaction.Transaction{
@@ -139,10 +152,12 @@ func TestAtomicTransactionBatchItem_CrossSideOnlyForRevert(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		action   string
+		status   string
 		wantCode string
 	}{
-		{name: "revert item", action: constant.ActionRevert},
-		{name: "direct item", action: constant.ActionDirect, wantCode: constant.ErrTransactionAmbiguous.Error()},
+		{name: "revert item", action: constant.ActionRevert, status: constant.CREATED},
+		{name: "direct item", action: constant.ActionDirect, status: constant.CREATED, wantCode: constant.ErrTransactionAmbiguous.Error()},
+		{name: "hold item", action: constant.ActionHold, status: constant.PENDING, wantCode: constant.ErrTransactionAmbiguous.Error()},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			logger, spans, _, _ := libObservability.NewTrackingFromContext(context.Background())
@@ -153,7 +168,7 @@ func TestAtomicTransactionBatchItem_CrossSideOnlyForRevert(t *testing.T) {
 				organizationID: uuid.New(),
 				ledgerID:       uuid.New(),
 				input:          reversal,
-				status:         constant.CREATED,
+				status:         tc.status,
 				action:         tc.action,
 			}
 

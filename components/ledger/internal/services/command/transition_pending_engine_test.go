@@ -409,20 +409,6 @@ func TestPendingCancelReleasesACrossSideHold(t *testing.T) {
 	require.Len(t, executor.requests, 1, "the cancel must reach the engine to release the hold")
 }
 
-// TestPendingCommitRefusesACrossSideBody keeps the commit of the same body refused: settling it
-// would debit and credit one account in a single transaction.
-func TestPendingCommitRefusesACrossSideBody(t *testing.T) {
-	t.Setenv("AUDIT_LOG_ENABLED", "false")
-	uc, reader, executor, finalizer, in := newTransitionEngineUseCase(t, constant.APPROVED)
-	reader.persisted.Body = crossSidePendingBody(reader.persisted.Body)
-
-	_, err := uc.CommitTransactionV2(context.Background(), in)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), constant.ErrTransactionAmbiguous.Error())
-	assert.Empty(t, executor.requests)
-	assert.Empty(t, finalizer.envelopes)
-}
-
 func TestPendingCancelUsesPersistedOverdraftCapAndOnlyLoadsSources(t *testing.T) {
 	uc, reader, executor, _, in := newTransitionEngineUseCase(t, constant.CANCELED)
 	historicalUsage := decimal.NewFromInt(4)
