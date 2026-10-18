@@ -281,19 +281,21 @@ func TestResolveEngineConfiguration_RowsMissingOnThePrimaryWriteNothing(t *testi
 // A balance loaded with a copy that carries the version the engine decides with but
 // other content is reported once per balance and once per account, with a Warn and
 // the divergence counter by family; a copy at another version, or with the same
-// content, is not.
+// content, is not. A cached copy with other content also reloads its keys.
 func TestResolveEngineConfiguration_ReportsACopyDivergingUnderTheDecidedVersion(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name            string
 		seeded          bool
+		reloads         bool
 		shape           func(f configResolutionFixture, sibling *mmodel.Balance)
 		balanceDiverges int64
 		accountDiverges int64
 	}{
 		{
-			name: "same versions, other content",
+			name:    "same versions, other content",
+			reloads: true,
 			shape: func(f configResolutionFixture, sibling *mmodel.Balance) {
 				// An earlier release turned sending on and unblocked the account in
 				// the blobs without changing the version fields it does not know.
@@ -324,10 +326,20 @@ func TestResolveEngineConfiguration_ReportsACopyDivergingUnderTheDecidedVersion(
 			},
 		},
 		{
-			name: "older versions",
+			name:    "older versions",
+			reloads: true,
 			shape: func(f configResolutionFixture, sibling *mmodel.Balance) {
 				f.loaded.ConfigVersion, f.loaded.AccountConfigVersion = 3, 1
 				sibling.AccountConfigVersion = 1
+			},
+		},
+		{
+			// The steady state after a reload: older version fields, the keys' content.
+			name: "older versions, same content",
+			shape: func(f configResolutionFixture, sibling *mmodel.Balance) {
+				*f.loaded = *f.primary
+				f.loaded.ConfigVersion, f.loaded.Blocked = 0, true
+				sibling.Blocked = true
 			},
 		},
 		{
@@ -382,8 +394,15 @@ func TestResolveEngineConfiguration_ReportsACopyDivergingUnderTheDecidedVersion(
 				seeds = seededLoad(f.loaded, sibling)
 			}
 
-			// No key write is expected: a row that does not outrank its key never
-			// replaces it.
+			// A seeded row that does not outrank its key never replaces it.
+			if tt.reloads {
+				f.expectPrimaryReads()
+				f.redis.EXPECT().WriteBalanceConfig(gomock.Any(), f.orgID, f.ledgerID, f.ref, balanceConfig).
+					Return(balanceConfig, redis.ConfigUnchanged, nil)
+				f.redis.EXPECT().WriteAccountConfig(gomock.Any(), f.orgID, f.ledgerID, accountConfig).
+					Return(accountConfig, redis.ConfigUnchanged, nil)
+			}
+
 			require.NoError(t, f.uc.resolveEngineConfiguration(ctx, f.orgID, f.ledgerID, []*mmodel.Balance{f.loaded, sibling}, seeds))
 			assertCarriesPrimaryConfiguration(t, f.loaded)
 

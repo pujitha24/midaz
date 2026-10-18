@@ -336,12 +336,12 @@ func TestIntegrationEngineBlobCopyNeverMovesBack(t *testing.T) {
 // TestIntegrationEngineKeepsAnExistingBlobsConfigurationCopy pins that an approved
 // execution never writes configuration into a blob that already exists. A release
 // that reads the configuration from the blob changes the copy's content without
-// touching the version fields it does not know, so no label tells how old the
-// content is: the copy may hold a change that release served after every live key.
-// The keys still decide the execution; the blob keeps both copies, every field in
-// the representations it had and both version fields, present or absent, byte for
-// byte. Money, version and identity move as usual. Only a PATCH writes the copy of
-// an existing blob.
+// touching the version fields it does not know, so no label tells how old it is.
+// The Go load reloads keys that differ from the copy, so they reach the engine only
+// when the copy is stale against PostgreSQL (the keys hold the row) or that release's
+// PATCH lands after the load. The keys decide; the blob keeps both copies byte for
+// byte, both version fields included. Money, version and identity move as usual.
+// Only a PATCH writes the copy of an existing blob.
 func TestIntegrationEngineKeepsAnExistingBlobsConfigurationCopy(t *testing.T) {
 	if testing.Short() {
 		t.Skip("requires Valkey")

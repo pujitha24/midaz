@@ -759,8 +759,13 @@ writes it to the key under the same version rule; an equal version keeps the key
 Where the account key is absent, the account row that load read is written to
 it, so the account is not read again. A row newer than its key was committed
 without the key, by a PATCH an earlier release served or by a PATCH whose key
-write failed before the client's retry. The load logs each such key at Warn. A cached balance reads no row, and its blob
-copy is left to the decision below.
+write failed before the client's retry. The load logs each such key at Warn. A cached balance reads no row while its
+keys hold the configuration its blob copy holds. A key whose content differs from
+that copy, at any version, is reloaded from the primary like an absent one, since
+the copy may hold a change an earlier release served. Such a change costs one
+reload, after which the key holds the row and agrees with the copy again. A copy
+already stale against PostgreSQL costs one primary read and one key write per
+load until a PATCH of this release rewrites the copy or the blob leaves the cache.
 
 The request carries the configuration the balance load resolved: the snapshot
 holds the balance configuration and `balanceConfigVersion` its version, and each
@@ -1454,12 +1459,30 @@ copy and current pods decide as described in
 [Configuration keys](#configuration-keys). A configuration PATCH served by an
 earlier pod writes PostgreSQL and the cached blobs but no configuration key, and
 leaves the blob's version fields as they were; a blob an earlier pod seeds from
-scratch has no version fields. Current pods see that change after the
-next PATCH a current pod serves on that balance or account, when a current pod
-seeds one of its balances from a cache miss (for the balance configuration, once
-the replica serving that read has the change), or once the key expires: at most
-one hour. An account blocked by an earlier pod during the
-rollout can therefore still transact on current pods for up to one hour.
+scratch has no version fields. An earlier pod commits PostgreSQL first and
+writes the blob after. Current pods decide with that change from their next load
+of the balance once the blob holds it: a cached balance whose blob copy differs
+from its key reloads the key from the primary, and a balance seeded from a cache
+miss decides with its rows. Between the earlier pod's commit and its blob write,
+current pods still decide with the live key.
+
+The change stays invisible to current pods for up to one hour, the key's
+lifetime, wherever it reached PostgreSQL but not the blob, so the blob still
+agrees with the older key:
+
+- The earlier pod's blob write failed: its settings PATCH gives up silently
+  after three compare-and-set attempts, which a busy balance makes likely, and a
+  block or a sending/receiving PATCH can meet a Redis error.
+- The balance was not cached: the earlier pod had no blob to write, and a current
+  pod that loaded the balance before the PATCH committed seeds the blob from that
+  older decision.
+- A current pod seeded the balance from a replica that had not applied the change
+  yet (balance configuration only; the account row is read from the primary).
+
+Once the last earlier-release pod is gone, delete every configuration key
+(`account-config` and `balance-config`, under any tenant prefix): each next load
+reloads them from the primary, which ends this exposure at the rollout instead
+of an hour later.
 
 Current pods never undo that change in the blob: they never write the
 configuration copy of a blob that exists, whatever its version fields say. A

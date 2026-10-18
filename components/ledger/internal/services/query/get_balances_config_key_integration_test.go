@@ -114,12 +114,11 @@ func (i *reseedTestInfra) execBalance(t *testing.T, statement string, args ...an
 // cannot have come from the blob.
 func (i *reseedTestInfra) cacheBlob(t *testing.T, accountID, balanceID uuid.UUID, alias, key string, version int64) {
 	t.Helper()
-	i.cacheBlobWithCopyVersion(t, accountID, balanceID, alias, key, version, 0)
+	i.cacheBlobCopying(t, accountID, balanceID, alias, key, version, func(*accounting.BalanceSnapshot) {})
 }
 
-// cacheBlobWithCopyVersion is cacheBlob with the balance configuration copy at
-// copyVersion.
-func (i *reseedTestInfra) cacheBlobWithCopyVersion(t *testing.T, accountID, balanceID uuid.UUID, alias, key string, version, copyVersion int64) {
+// cacheBlobCopying is cacheBlob with edit applied to the blob's configuration copy.
+func (i *reseedTestInfra) cacheBlobCopying(t *testing.T, accountID, balanceID uuid.UUID, alias, key string, version int64, edit func(*accounting.BalanceSnapshot)) {
 	t.Helper()
 
 	snapshot := accounting.BalanceSnapshot{
@@ -127,14 +126,24 @@ func (i *reseedTestInfra) cacheBlobWithCopyVersion(t *testing.T, accountID, bala
 		AccountType: "deposit", AssetCode: "USD", Alias: alias, Key: key,
 		Direction: "credit", BalanceScope: mmodel.BalanceScopeTransactional,
 		Available: decimal.NewFromInt(100), Version: version,
-		AllowSending: true, AllowReceiving: true, ConfigVersion: copyVersion,
+		AllowSending: true, AllowReceiving: true,
 	}
+	edit(&snapshot)
 
 	encoded, err := balancecache.Encode(snapshot, balancecache.FormatDual)
 	require.NoError(t, err)
 
 	require.NoError(t, i.redis.Client.Set(context.Background(),
 		utils.BalanceInternalKey(i.orgID, i.ledgerID, snapshot.BalanceRef), encoded, time.Hour).Err())
+}
+
+// holding makes a blob's copy hold the given configurations under their versions.
+func holding(config accounting.BalanceConfig, account accounting.AccountConfig) func(*accounting.BalanceSnapshot) {
+	return func(s *accounting.BalanceSnapshot) {
+		s.ConfigVersion, s.AllowSending, s.AllowReceiving = config.Version, config.AllowSending, config.AllowReceiving
+		s.AllowOverdraft, s.OverdraftLimitEnabled, s.OverdraftLimit = config.AllowOverdraft, config.OverdraftLimitEnabled, config.OverdraftLimit
+		s.BalanceScope, s.AccountConfigVersion, s.Blocked = config.BalanceScope, account.Version, account.Blocked
+	}
 }
 
 func (i *reseedTestInfra) readKeys(t *testing.T, ctx context.Context, refs []string, accountIDs []uuid.UUID) redis.ConfigKeyValues {
@@ -241,10 +250,8 @@ func TestIntegration_EngineConfig_LiveKeysAreUsedWithoutReadingTheDatabase(t *te
 	companionRef := alias + "#" + constant.OverdraftBalanceKey
 
 	// Everything the load needs is cached: both blobs, both balance keys and the
-	// account key. The keys disagree with the blobs and the rows on purpose.
-	infra.cacheBlob(t, accountID, balanceID, alias, constant.DefaultBalanceKey, 4)
-	infra.cacheBlob(t, accountID, companionID, alias, constant.OverdraftBalanceKey, 0)
-
+	// account key. The keys disagree with the rows on purpose; each blob's copy holds
+	// its keys, as a PATCH of this release leaves it.
 	keyConfig := accounting.BalanceConfig{
 		BalanceID: balanceID, Version: 5, AllowSending: false, AllowReceiving: true,
 		AllowOverdraft: true, OverdraftLimitEnabled: true, OverdraftLimit: decimal.NewFromInt(10),
@@ -260,9 +267,12 @@ func TestIntegration_EngineConfig_LiveKeysAreUsedWithoutReadingTheDatabase(t *te
 		require.NoError(t, err)
 	}
 
-	_, _, err := infra.uc.TransactionRedisRepo.WriteAccountConfig(ctx, infra.orgID, infra.ledgerID,
-		accounting.AccountConfig{AccountID: accountID, Version: 2, Blocked: true})
+	accountConfig := accounting.AccountConfig{AccountID: accountID, Version: 2, Blocked: true}
+	_, _, err := infra.uc.TransactionRedisRepo.WriteAccountConfig(ctx, infra.orgID, infra.ledgerID, accountConfig)
 	require.NoError(t, err)
+
+	infra.cacheBlobCopying(t, accountID, balanceID, alias, constant.DefaultBalanceKey, 4, holding(keyConfig, accountConfig))
+	infra.cacheBlobCopying(t, accountID, companionID, alias, constant.OverdraftBalanceKey, 0, holding(companionConfig, accountConfig))
 
 	balances, accounts := infra.spyOnRepositories()
 
@@ -519,8 +529,8 @@ func TestIntegration_EngineConfig_ReloadReadsThePrimary(t *testing.T) {
 // served writes PostgreSQL and no configuration key — leaves a live key older than
 // the row. A balance loaded from its row, because it was not cached, already holds
 // that row and its account row, so the newer version decides and is written to the
-// key, with no further read. An equal version keeps the key, and a cached balance
-// keeps deciding with its key without reading its configuration rows.
+// key, with no further read. An equal version keeps the key. A cached balance whose
+// blob copy holds that change, unlike its keys, reloads them from the primary.
 func TestIntegration_EngineConfig_ColdBalanceDecidesWithARowNewerThanTheLiveKey(t *testing.T) {
 	infra := setupReseedTestInfra(t)
 
@@ -666,17 +676,18 @@ func TestIntegration_EngineConfig_ColdBalanceDecidesWithARowNewerThanTheLiveKey(
 		assert.Equal(t, accounting.AccountConfig{AccountID: accountID, Version: 0, Blocked: true}, keys.Accounts[accountID])
 	})
 
-	t.Run("a cached balance decides with its key and reads no configuration row", func(t *testing.T) {
+	t.Run("a cached balance whose copy differs from its keys reloads them from the primary", func(t *testing.T) {
 		ctx := context.Background()
 		accountID, balanceID, alias := infra.seedBalance(t, "cfg-hot-older-key", decimal.NewFromInt(100), 1)
 		ref := alias + "#" + constant.DefaultBalanceKey
 
 		writeKeys(t, ctx, ref, accountID, true, false)
 		changeRows(t, accountID, balanceID)
-		// The blob's copy is newer than the key: it is left to the engine's decision
-		// and never taken for a row the load read.
-		infra.cacheBlobWithCopyVersion(t, accountID, balanceID, alias, constant.DefaultBalanceKey, 1, 1)
-		before := infra.readKeys(t, ctx, []string{ref}, []uuid.UUID{accountID})
+		// The earlier release changed the blob's copy too, and left its version fields
+		// at the keys' version 0.
+		infra.cacheBlobCopying(t, accountID, balanceID, alias, constant.DefaultBalanceKey, 1, func(s *accounting.BalanceSnapshot) {
+			s.AllowSending, s.Blocked = false, true
+		})
 
 		balances, accounts := spy(t)
 
@@ -684,14 +695,24 @@ func TestIntegration_EngineConfig_ColdBalanceDecidesWithARowNewerThanTheLiveKey(
 		require.NoError(t, err)
 
 		got := engineBalanceByRef(t, execution, ref)
-		assert.Equal(t, int64(0), got.ConfigVersion, "a live key decides a cached balance")
-		assert.True(t, got.AllowSending)
-		assert.False(t, got.Blocked)
-		assert.Equal(t, before, infra.readKeys(t, ctx, []string{ref}, []uuid.UUID{accountID}), "a cached balance never rewrites its keys")
+		assert.Equal(t, int64(1), got.ConfigVersion, "the primary row decides")
+		assert.False(t, got.AllowSending)
+		assert.True(t, got.Blocked, "the account row decides")
+		assert.Equal(t, int64(1), got.AccountConfigVersion)
 
-		// The uncached overdraft companion is still looked up by alias, as before; no
-		// configuration row is read.
-		assert.Zero(t, balances.primaryReads.Load(), "a cached balance with live keys reloads no configuration")
-		assert.Zero(t, accounts.listByIDs.Load(), "a cached balance with a live account key reads no account row")
+		assert.Equal(t, int32(1), balances.primaryReads.Load(), "the diverging balance key is reloaded from the primary")
+		assert.Equal(t, int32(1), accounts.listByIDs.Load(), "the diverging account key is reloaded from the primary")
+
+		keys := infra.readKeys(t, ctx, []string{ref}, []uuid.UUID{accountID})
+		assert.True(t, keys.Balances[ref].Equal(infra.primaryConfig(t, ref)), "the balance key takes the row: %+v", keys.Balances[ref])
+		assert.Equal(t, accounting.AccountConfig{AccountID: accountID, Version: 1, Blocked: true}, keys.Accounts[accountID])
+
+		// The copy's version fields stay older than the keys, but the content agrees.
+		balances, accounts = spy(t)
+
+		_, _, err = infra.uc.GetEngineBalances(ctx, infra.orgID, infra.ledgerID, []string{ref})
+		require.NoError(t, err)
+		assert.Zero(t, balances.primaryReads.Load(), "a copy agreeing with its keys reloads nothing")
+		assert.Zero(t, accounts.listByIDs.Load())
 	})
 }

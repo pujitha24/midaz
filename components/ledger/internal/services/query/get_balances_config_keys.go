@@ -33,12 +33,13 @@ const (
 // (sending, receiving, overdraft, scope) and the owning account's blocked flag.
 //
 // The configuration keys are the source while they live. One batched read covers
-// the whole pool, so a hot balance whose keys are present reads no database row. A
-// key that is missing, unreadable or describes another balance (one deleted and
-// recreated under the same alias#key) is reloaded from the PostgreSQL primary,
-// never a replica that could seed a stale value for the key's whole life, and
-// written back under the version rule: a key a concurrent update already moved to
-// a newer version wins and is what the balance carries.
+// the whole pool, so a hot balance whose keys are present and agree with its blob
+// copy reads no database row. A key that is missing, unreadable, differs from that
+// copy or describes another balance (one deleted and recreated under the same
+// alias#key) is reloaded from the PostgreSQL primary, never a replica that could
+// seed a stale value for the key's whole life, and written back under the version
+// rule: a key a concurrent update already moved to a newer version wins and is what
+// the balance carries.
 //
 // A balance in seeds was loaded from its row on a cache miss, so this load already
 // holds its configuration and its account's blocked flag as PostgreSQL has them.
@@ -52,8 +53,7 @@ const (
 // older configuration, which a refusal never heals and an earlier release obeys
 // after a rollback. The seed's balance read follows read routing, so its row may
 // come from a replica; it still wins only when newer than the key, which it never
-// moves back. A cached balance's blob copy is not a row and is left to the
-// engine's newest-version decision; it never reads PostgreSQL.
+// moves back.
 //
 // Absence is the normal state after a deploy and on every expiry, so it is never
 // an error. Neither is a failed key write: the primary row is the truth, the
@@ -94,6 +94,8 @@ func (uc *UseCase) resolveEngineConfiguration(ctx context.Context, organizationI
 
 		keys = redis.ConfigKeyValues{}
 	}
+
+	dropKeysDivergingFromCachedCopies(targets, keys)
 
 	balanceConfigs, err := uc.resolveBalanceConfigs(ctx, span, organizationID, ledgerID, targets, keys.Balances)
 	if err != nil {
@@ -170,27 +172,50 @@ func (d *configCopyDivergence) addAccount(accountID uuid.UUID) {
 // existed, or versions moved back. The engine decides with the key and keeps the
 // blob's copy; nothing in the execution reports it, so the load does.
 func balanceCopyDiverges(loaded *mmodel.Balance, resolved accounting.BalanceConfig) bool {
-	if loaded.ConfigVersion != resolved.Version {
-		return false
-	}
+	return loaded.ConfigVersion == resolved.Version && balanceCopyDiffers(loaded, resolved)
+}
 
+// balanceCopyDiffers reports whether the configuration a balance was loaded with
+// holds other content than config, whatever their versions.
+func balanceCopyDiffers(loaded *mmodel.Balance, config accounting.BalanceConfig) bool {
 	copied, err := balancecache.BalanceConfigFromBalance(loaded)
 	if err != nil {
 		return false
 	}
 
+	copied.Version = config.Version
+
 	// A disabled limit is inert, and a balance read from the cache does not carry
 	// it, so it is compared only when enabled.
-	if !copied.OverdraftLimitEnabled && !resolved.OverdraftLimitEnabled {
-		copied.OverdraftLimit = resolved.OverdraftLimit
+	if !copied.OverdraftLimitEnabled && !config.OverdraftLimitEnabled {
+		copied.OverdraftLimit = config.OverdraftLimit
 	}
 
-	return !copied.Equal(resolved)
+	return !copied.Equal(config)
 }
 
 // accountCopyDiverges is balanceCopyDiverges for the account's blocked flag.
 func accountCopyDiverges(loaded *mmodel.Balance, resolved accounting.AccountConfig) bool {
 	return loaded.AccountConfigVersion == resolved.Version && loaded.Blocked != resolved.Blocked
+}
+
+// dropKeysDivergingFromCachedCopies removes every live key whose content differs
+// from a cached balance's blob copy, at any version: a release that writes no key
+// changes only the copy, so the key is reloaded from the primary like an absent one.
+func dropKeysDivergingFromCachedCopies(targets []configurationTarget, keys redis.ConfigKeyValues) {
+	for _, target := range targets {
+		if target.seeded {
+			continue
+		}
+
+		if config, ok := keys.Balances[target.ref]; ok && balanceCopyDiffers(target.balance, config) {
+			delete(keys.Balances, target.ref)
+		}
+
+		if config, ok := keys.Accounts[target.accountID]; ok && target.balance.Blocked != config.Blocked {
+			delete(keys.Accounts, target.accountID)
+		}
+	}
 }
 
 // reportConfigCopyDivergence logs the divergent copies of one load at Warn, with
@@ -540,9 +565,8 @@ func applyBalanceConfig(b *mmodel.Balance, config accounting.BalanceConfig) {
 }
 
 // recordConfigReloaded counts configurations reloaded from the primary because their
-// key was absent, which is the database cost of the keys' fixed expiry; an account
-// row a seed's blocked hydration already read counts once, with no read of its own.
-// Best-effort: a metric failure never affects the load.
+// key was absent or differed from a cached copy (see utils.ConfigKeyReloaded); an
+// account row a seed already read counts once. A metric failure never affects the load.
 func (uc *UseCase) recordConfigReloaded(ctx context.Context, span trace.Span, family string, reloaded int) {
 	if reloaded == 0 {
 		return
