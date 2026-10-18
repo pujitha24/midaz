@@ -207,9 +207,8 @@ var (
 	// copy (the blob's, or the row's on a cache miss) carries the version the engine
 	// decides with but other content, by family (balance|account). The engine decides
 	// with the configuration key and keeps the blob's copy, so nothing fails; a
-	// nonzero rate means a release that reads the configuration from the blob changed
-	// it without a version (expected only while earlier pods serve PATCHes), a copy
-	// that diverged before versions existed, or versions moved back.
+	// nonzero rate means a copy that diverged before versions existed, or versions
+	// moved back. A change an earlier release served reloads under its newer version.
 	ConfigCopyDivergent = metrics.Metric{
 		Name:        "config_copy_divergent_total",
 		Unit:        "1",

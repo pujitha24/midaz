@@ -297,8 +297,8 @@ func TestResolveEngineConfiguration_ReportsACopyDivergingUnderTheDecidedVersion(
 			name:    "same versions, other content",
 			reloads: true,
 			shape: func(f configResolutionFixture, sibling *mmodel.Balance) {
-				// An earlier release turned sending on and unblocked the account in
-				// the blobs without changing the version fields it does not know.
+				// The blobs carry the keys' versions with other content, as a copy
+				// that diverged before versions existed does.
 				f.loaded.ConfigVersion, f.loaded.AccountConfigVersion = 4, 2
 				sibling.AccountConfigVersion = 2
 			},
@@ -394,7 +394,6 @@ func TestResolveEngineConfiguration_ReportsACopyDivergingUnderTheDecidedVersion(
 				seeds = seededLoad(f.loaded, sibling)
 			}
 
-			// A seeded row that does not outrank its key never replaces it.
 			if tt.reloads {
 				f.expectPrimaryReads()
 				f.redis.EXPECT().WriteBalanceConfig(gomock.Any(), f.orgID, f.ledgerID, f.ref, balanceConfig).

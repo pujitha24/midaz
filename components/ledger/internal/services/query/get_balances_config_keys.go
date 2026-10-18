@@ -167,10 +167,9 @@ func (d *configCopyDivergence) addAccount(accountID uuid.UUID) {
 // balanceCopyDiverges reports whether the configuration a balance was loaded with —
 // the copy in its blob, or its row on a cache miss — carries the version the engine
 // decides with but other content. A version names one committed row state, so that
-// is an inconsistency: a release that reads the configuration from the blob changed
-// the copy without a version it does not know, a copy diverged before versions
-// existed, or versions moved back. The engine decides with the key and keeps the
-// blob's copy; nothing in the execution reports it, so the load does.
+// is an inconsistency: a copy diverged before versions existed, or versions moved
+// back. The engine decides with the key and keeps the blob's copy; nothing in the
+// execution reports it, so the load does.
 func balanceCopyDiverges(loaded *mmodel.Balance, resolved accounting.BalanceConfig) bool {
 	return loaded.ConfigVersion == resolved.Version && balanceCopyDiffers(loaded, resolved)
 }
@@ -201,7 +200,8 @@ func accountCopyDiverges(loaded *mmodel.Balance, resolved accounting.AccountConf
 
 // dropKeysDivergingFromCachedCopies removes every live key whose content differs
 // from a cached balance's blob copy, at any version: a release that writes no key
-// changes only the copy, so the key is reloaded from the primary like an absent one.
+// changes PostgreSQL and the copy, never the key, so the key is reloaded from the
+// primary like an absent one.
 func dropKeysDivergingFromCachedCopies(targets []configurationTarget, keys redis.ConfigKeyValues) {
 	for _, target := range targets {
 		if target.seeded {

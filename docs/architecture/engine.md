@@ -746,26 +746,31 @@ balance value also carries the balance ID. The value contract is fixed in
 `adapters/redis/balancecache/config.go`.
 
 Only Go writes these keys: a PATCH with the row its `UPDATE` returned, and the
-balance load with a primary read when a key is absent. A key lives one hour from
-that write and is never renewed. The engine only reads them. It never writes,
-recreates, or extends one; a key that expired between the balance load and the
-script leaves the request's configuration in force for that execution only.
+balance load with a primary read when a key is absent or differs from a cached
+balance's blob copy. A key lives one hour from that write and is never renewed.
+The engine only reads them. It never writes, recreates, or extends one; a key
+that expired between the balance load and the script leaves the request's
+configuration in force for that execution only.
 
-The balance load uses a live key, except for a balance it seeds from its row on a
-cache miss: that load already read the balance row, through read routing (a
+The balance load uses a live key, except where the key differs from a cached
+balance's blob copy (below) and for a balance it seeds from its row on a cache
+miss: that load already read the balance row, through read routing (a
 replica where one serves reads), and its account row, from the primary. Where
 either row carries a newer version than its key, the row decides and the load
 writes it to the key under the same version rule; an equal version keeps the key.
 Where the account key is absent, the account row that load read is written to
 it, so the account is not read again. A row newer than its key was committed
 without the key, by a PATCH an earlier release served or by a PATCH whose key
-write failed before the client's retry. The load logs each such key at Warn. A cached balance reads no row while its
-keys hold the configuration its blob copy holds. A key whose content differs from
-that copy, at any version, is reloaded from the primary like an absent one, since
-the copy may hold a change an earlier release served. Such a change costs one
-reload, after which the key holds the row and agrees with the copy again. A copy
-already stale against PostgreSQL costs one primary read and one key write per
-load until a PATCH of this release rewrites the copy or the blob leaves the cache.
+write failed before the client's retry. The load logs each such key at Warn. A
+cached balance reads no row while its keys hold the configuration its blob copy
+holds. A key whose content differs from that copy, at any version, is reloaded
+from the primary like an absent one, since the copy may hold a change an earlier
+release served. Such a change costs one reload, after which the key holds the
+row and agrees with the copy again. A copy already stale against PostgreSQL
+costs one primary read and one key write per load until a PATCH of this release
+rewrites the copy; a PATCH that sets the settings the balance already has is
+enough. Every execution renews a busy balance's blob, so leaving the cache does
+not end it there.
 
 The request carries the configuration the balance load resolved: the snapshot
 holds the balance configuration and `balanceConfigVersion` its version, and each
@@ -1473,11 +1478,12 @@ agrees with the older key:
 - The earlier pod's blob write failed: its settings PATCH gives up silently
   after three compare-and-set attempts, which a busy balance makes likely, and a
   block or a sending/receiving PATCH can meet a Redis error.
-- The balance was not cached: the earlier pod had no blob to write, and a current
-  pod that loaded the balance before the PATCH committed seeds the blob from that
-  older decision.
-- A current pod seeded the balance from a replica that had not applied the change
-  yet (balance configuration only; the account row is read from the primary).
+- The balance was not cached: the earlier pod had no blob to write, and a pod of
+  either release that loaded the balance before the PATCH committed seeds the
+  blob from that older decision.
+- A pod of either release seeded the balance from a replica that had not applied
+  the change yet (a current pod reads the account row from the primary; an
+  earlier-release pod may read it from a replica too).
 
 Once the last earlier-release pod is gone, restart the ledger and wait until no
 pod that ran next to an earlier-release pod is left. Then delete every
@@ -1485,10 +1491,10 @@ configuration key (`account-config` and `balance-config`, under any tenant
 prefix): each next load reloads them from the primary, which ends this exposure
 at the rollout instead of an hour later. The restart comes first because a load
 in flight writes the rows it read before the earlier pod's last PATCH back as a
-missing key; only a process that exited before the deletion cannot. The
-deletion does not cover a balance PATCH committed within the replica lag before
-it: a pod that seeds that balance from a replica that has not applied the PATCH
-yet writes the older balance configuration back, for up to the key's lifetime.
+missing key; only a process that exited before the deletion cannot. One case
+remains: a load that read a live key before the deletion still writes, after it,
+a balance row it seeded from a replica when that row outranks the key it read,
+and such a row misses any PATCH committed within the replica lag.
 
 Current pods never undo that change in the blob: they never write the
 configuration copy of a blob that exists, whatever its version fields say. A
