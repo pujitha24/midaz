@@ -242,3 +242,61 @@ func TestHuma_Validate_MalformedJSON(t *testing.T) {
 	assert.Equal(t, "0094", got["code"], "code must be ErrInvalidRequestBody, identical to the Fiber path")
 	assert.Empty(t, svc.capturedTenant, "service must not be reached on malformed JSON")
 }
+
+// postValidation sends body to path on app and returns the status and the
+// decoded JSON body.
+func postValidation(t *testing.T, app *fiber.App, path string, body []byte) (int, map[string]any) {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := app.Test(req, fiber.TestConfig{Timeout: 0})
+	require.NoError(t, err)
+	defer func() { _ = httpResp.Body.Close() }()
+
+	respBody, err := io.ReadAll(httpResp.Body)
+	require.NoError(t, err)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(respBody, &got), "body must be JSON: %s", string(respBody))
+
+	return httpResp.StatusCode, got
+}
+
+func rulesOnlySpy() *validationSpyService {
+	resp := model.NewValidationResponse(testutil.MustDeterministicUUID(10), testutil.MustDeterministicUUID(1), model.DecisionAllow, testutil.FixedTime())
+
+	return &validationSpyService{result: &services.ValidateResult{Response: resp, IsDuplicate: false}}
+}
+
+func TestHuma_ValidateRulesOnly_PassesRulesOnly(t *testing.T) {
+	svc := rulesOnlySpy()
+	app := buildHumaValidationApp(t, svc, "tenant-alpha")
+
+	status, got := postValidation(t, app, "/v1/validations/rules-only", validValidationRequestBody(t))
+
+	assert.Equal(t, http.StatusCreated, status)
+	assert.Equal(t, "ALLOW", got["decision"])
+	require.NotNil(t, svc.captured, "the rules-only route must reach the service")
+	assert.True(t, svc.captured.RulesOnly, "the rules-only route must ask for a rules-only verdict")
+	assert.Equal(t, "tenant-alpha", svc.capturedTenant)
+}
+
+func TestHuma_Validate_BodyCannotSetRulesOnly(t *testing.T) {
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(validValidationRequestBody(t), &body))
+
+	body["rulesOnly"] = true
+	raw, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	svc := rulesOnlySpy()
+	app := buildHumaValidationApp(t, svc, "tenant-alpha")
+
+	status, _ := postValidation(t, app, "/v1/validations", raw)
+
+	assert.Equal(t, http.StatusCreated, status)
+	require.NotNil(t, svc.captured)
+	assert.False(t, svc.captured.RulesOnly, "a body must never switch the full route to rules-only")
+}

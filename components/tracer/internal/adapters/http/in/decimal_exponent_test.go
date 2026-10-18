@@ -38,7 +38,7 @@ func TestHandlersRefuseOutOfBoundDecimals(t *testing.T) {
 			return err
 		}},
 		{"validate", "amount", func() error {
-			_, err := (&ValidationHandler{clock: clock.New()}).validate(ctx, []byte(`{"amount":"`+value+`"}`))
+			_, err := (&ValidationHandler{clock: clock.New()}).validate(ctx, []byte(`{"amount":"`+value+`"}`), false)
 			return err
 		}},
 	}

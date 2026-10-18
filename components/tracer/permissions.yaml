@@ -63,11 +63,15 @@ scope:
   routes:
     - method: POST
       path: /v1/validations
-      dimensions:
+      dimensions: &validationBodyDimensions
         - { name: accountId,   from: body, field: account.accountId }
         - { name: segmentId,   from: body, field: segment.segmentId,     optional: true }
         - { name: portfolioId, from: body, field: portfolio.portfolioId, optional: true }
         - { name: merchantId,  from: body, field: merchant.merchantId,   optional: true }
+    # Same validations/post guard and body as POST /v1/validations; rules only, no limit counted.
+    - method: POST
+      path: /v1/validations/rules-only
+      dimensions: *validationBodyDimensions
     - method: GET
       path: /v1/validations
       dimensions: &validationListQueryDimensions

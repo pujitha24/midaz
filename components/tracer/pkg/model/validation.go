@@ -86,6 +86,9 @@ type ValidationRequest struct {
 	Portfolio            *PortfolioContext `json:"portfolio,omitempty"`
 	Merchant             *MerchantContext  `json:"merchant,omitempty"`
 	Metadata             map[string]any    `json:"metadata,omitempty"`
+	// RulesOnly is set by the rules-only route, never by a body: the request is
+	// judged by rules alone and never checks or counts a limit.
+	RulesOnly bool `json:"-"`
 }
 
 // NewValidationRequest creates a new ValidationRequest with validation and normalization.

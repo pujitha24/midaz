@@ -189,6 +189,13 @@ func TestRoutes_ProtectedEndpoints_RequireAuth(t *testing.T) {
 			expectedCode:   "Unauthenticated",
 		},
 		{
+			name:           "POST /v1/validations/rules-only returns 401 without API key",
+			method:         http.MethodPost,
+			path:           "/v1/validations/rules-only",
+			expectedStatus: http.StatusUnauthorized,
+			expectedCode:   "Unauthenticated",
+		},
+		{
 			name:           "GET /v1/rules returns 401 without API key",
 			method:         http.MethodGet,
 			path:           "/v1/rules",

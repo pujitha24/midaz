@@ -164,3 +164,24 @@ func TestTracerManifest_DeclaresTheSeedReservationGrant(t *testing.T) {
 	require.Equal(t, "allow", grants[0].Effect)
 	require.ElementsMatch(t, []string{"editor", "validator", "audit-viewer"}, grants[0].Roles)
 }
+
+// The rules-only route shares the validations/post grant, so it must read the same scope as POST /v1/validations.
+func TestTracerManifest_RulesOnlyRouteSharesValidationsScope(t *testing.T) {
+	t.Parallel()
+
+	var manifest declaration.DeclarationManifest
+
+	require.NoError(t, yaml.Unmarshal(tracer.TracerManifest, &manifest))
+
+	dimensions := make(map[string][]declaration.DeclarationRouteDimension, len(manifest.Scope.Routes))
+	for _, route := range manifest.Scope.Routes {
+		dimensions[route.Method+" "+route.Path] = route.Dimensions
+	}
+
+	full, declared := dimensions["POST /v1/validations"]
+	require.True(t, declared, "POST /v1/validations declares no scope route")
+
+	rulesOnly, declared := dimensions["POST /v1/validations/rules-only"]
+	require.True(t, declared, "POST /v1/validations/rules-only declares no scope route")
+	require.Equal(t, full, rulesOnly, "the rules-only route must read the same scope dimensions as POST /v1/validations")
+}
