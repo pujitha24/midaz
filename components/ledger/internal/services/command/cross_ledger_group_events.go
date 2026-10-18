@@ -54,7 +54,11 @@ func (uc *UseCase) publishTransactionGroupEvent(
 
 	src := buildTransactionGroupEventSource(kind, groupID, revertedGroupID, transactions, roleOf, uc.transactionGroupEventTime())
 
+	finish := uc.TrackEventDispatch()
+
 	go func() {
+		defer finish()
+
 		emitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asyncOperationTimeout)
 		defer cancel()
 

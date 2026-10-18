@@ -56,7 +56,21 @@ type UnifiedServer struct {
 	logger        libLog.Logger
 	telemetry     *libOpentelemetry.Telemetry
 	readyzHandler *ReadyzHandler
+	onShutdown    func(context.Context) error
 }
+
+// shutdownTimeout bounds the HTTP drain (12s load-balancer delay, then 18s for
+// requests) and each hook. With the 10s event wait, the 5s flush and the client
+// close, shutdown reaches telemetry near 47s, inside the 60s pod grace period.
+const shutdownTimeout = 30 * time.Second
+
+// eventDrainTimeout bounds the wait for running dispatches on purpose: their
+// balance events emit one per operation, so a slow broker can outlast it.
+const eventDrainTimeout = 10 * time.Second
+
+// producerCloseTimeout bounds the producer flush at close: one emit at the 5s
+// emit timeout. The lib falls back to 30s, which overruns the grace period.
+const producerCloseTimeout = 5 * time.Second
 
 // skipTelemetryPaths lists the request paths excluded from HTTP telemetry, per
 // T11 in docs/standards/telemetry.md. A k8s probe generates one span and one
@@ -302,12 +316,31 @@ func (s *UnifiedServer) Run(l *libCommons.Launcher) error {
 	// it shuts telemetry down only AFTER the HTTP drain completes, so spans from
 	// in-flight requests are exported. A signal-fired Launcher runnable cannot
 	// provide that ordering (runnables wake concurrently on SIGTERM) — do not
-	// move ShutdownTelemetry out of this call.
+	// move ShutdownTelemetry out of this call. onShutdown runs between the two.
 	libCommonsServer.NewServerManager(nil, s.telemetry, s.logger).
 		WithHTTPServer(s.app, s.serverAddress).
+		WithShutdownTimeout(shutdownTimeout).
+		WithShutdownHook(s.onShutdown).
 		StartWithGracefulShutdown()
 
 	return nil
+}
+
+// drainEventsThenCloseProducer closes the streaming producer once running event
+// dispatches finish. It runs after the HTTP drain, with consumers stopped at
+// SIGTERM; a request that outlives the drain may dispatch after the close.
+func drainEventsThenCloseProducer(events *command.UseCase, closeProducer func() error, logger libLog.Logger) func(context.Context) error {
+	return func(ctx context.Context) error {
+		waitCtx, cancel := context.WithTimeout(ctx, eventDrainTimeout)
+		defer cancel()
+
+		if running := events.WaitEventDispatches(waitCtx); running > 0 {
+			logger.Log(ctx, libLog.LevelWarn, "Closing the streaming producer with event dispatches still running",
+				libLog.Int("running", int(running)))
+		}
+
+		return closeProducer()
+	}
 }
 
 // ServerAddress returns the server address for logging/debugging purposes.

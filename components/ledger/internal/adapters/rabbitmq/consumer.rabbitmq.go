@@ -775,9 +775,10 @@ func (cr *ConsumerRoutes) processIndividualMessage(
 			libLog.Err(err),
 		)
 
-		// Classify and route through the retry engine. workerID -1 marks the fallback path.
-		retryCount := pkgRabbitmq.RetryCountFromHeaders(msg.Headers)
-		retry.HandleFailure(msgCtx, fallbackWorkerID, queue, msg, err, retryCount, span)
+		// Consumers stopped: leave it unacked for redelivery; else retry (workerID -1 marks the fallback path).
+		if ctx.Err() == nil {
+			retry.HandleFailure(msgCtx, fallbackWorkerID, queue, msg, err, pkgRabbitmq.RetryCountFromHeaders(msg.Headers), span)
+		}
 
 		return
 	}

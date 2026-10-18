@@ -7,6 +7,7 @@ package command
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/LerianStudio/midaz/v4/components/ledger/internal/adapters/postgres/transaction"
 )
@@ -34,7 +35,11 @@ func (uc *UseCase) dispatchTransactionEvents(ctx context.Context, tran *transact
 
 	// Send events asynchronously with context that preserves trace but survives parent cancellation.
 	// Each emitter gets its own timeout budget so a slow earlier emitter cannot starve later ones.
+	finish := uc.TrackEventDispatch()
+
 	go func() {
+		defer finish()
+
 		base := context.WithoutCancel(ctx)
 
 		runWithTimeout := func(fn func(context.Context)) {
@@ -62,4 +67,33 @@ func (uc *UseCase) dispatchTransactionEvents(ctx context.Context, tran *transact
 
 		wg.Wait()
 	}()
+}
+
+// TrackEventDispatch counts work that may still emit streaming events until
+// the returned func runs. Call it before the work starts, never inside it.
+func (uc *UseCase) TrackEventDispatch() (finish func()) {
+	uc.eventDispatches.Add(1)
+
+	return func() { uc.eventDispatches.Add(-1) }
+}
+
+// WaitEventDispatches blocks until no tracked work is running or ctx ends, and
+// returns how many were still running. It polls a counter instead of a
+// WaitGroup because work may start while it waits.
+func (uc *UseCase) WaitEventDispatches(ctx context.Context) int64 {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		running := uc.eventDispatches.Load()
+		if running == 0 {
+			return 0
+		}
+
+		select {
+		case <-ctx.Done():
+			return running
+		case <-ticker.C:
+		}
+	}
 }

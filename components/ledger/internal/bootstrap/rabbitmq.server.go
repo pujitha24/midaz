@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	libCommons "github.com/LerianStudio/lib-commons/v7/commons"
 	"github.com/LerianStudio/lib-observability/v4/metrics"
@@ -54,9 +56,22 @@ func NewMultiQueueConsumer(routes *rabbitmq.ConsumerRoutes, useCase *command.Use
 	return consumer, nil
 }
 
-// Run starts consumers for all registered queues.
-func (mq *MultiQueueConsumer) Run(l *libCommons.Launcher) error {
-	return mq.consumerRoutes.RunConsumers()
+// Run starts consumers for all registered queues and stops them on SIGINT/SIGTERM,
+// so a delivery after the signal is refused and left for redelivery instead of
+// committing after the shutdown hook closes the streaming producer.
+func (mq *MultiQueueConsumer) Run(_ *libCommons.Launcher) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := mq.consumerRoutes.RunConsumers(); err != nil {
+		return err
+	}
+
+	<-ctx.Done()
+
+	mq.consumerRoutes.StopConsumers()
+
+	return nil
 }
 
 // handlerBTOQueue processes messages from the balance fifo queue, unmarshal the JSON, and update balances on database.

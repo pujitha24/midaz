@@ -128,10 +128,8 @@ func BuildStreamingEmitter(
 		return libStreaming.NewNoopEmitter(), noopStreamingCloser, nil
 	}
 
-	// Delegate env-var loading + defaulting to libStreaming.LoadConfig so
-	// every STREAMING_* knob (MaxBufferedRecords, BatchMaxBytes, CB
-	// ratios, CloseTimeout, etc.) gets its documented default rather than
-	// the zero value of the struct.
+	// LoadConfig parses and validates the STREAMING_* env; only the brokers,
+	// TLS and SASL settings reach the Builder below.
 	streamingCfg, warnings, err := libStreaming.LoadConfig()
 	if err != nil {
 		// LoadConfig validates the broker list itself, so the missing-broker case
@@ -203,7 +201,8 @@ func BuildStreamingEmitter(
 			Name:    streamingPrimaryTargetName,
 			Kind:    libStreaming.TransportKafkaLike,
 			Brokers: streamingCfg.Brokers,
-		})
+		}).
+		CloseTimeout(producerCloseTimeout)
 
 	// SASL/TLS are owned by lib-streaming: TLSFromConfig and SASLFromConfig
 	// read the STREAMING_TLS_* and STREAMING_SASL_* knobs already parsed by
