@@ -66,7 +66,7 @@ func NewValidationHandler(service ValidationService, clk clock.Clock) (*Validati
 }
 
 func (h *ValidationHandler) Validate(c fiber.Ctx) error {
-	result, err := h.validate(c.Context(), c.Body())
+	result, err := h.validate(c.Context(), c.Body(), false)
 	if err != nil {
 		return pkgHTTP.WithError(c, err)
 	}
@@ -94,7 +94,7 @@ func (h *ValidationHandler) Validate(c fiber.Ctx) error {
 // The payload-size guard is preserved from the Fiber path: Huma has no Fiber-style
 // body limit, so the check must live in the core; an oversized body yields the
 // canonical ErrPayloadTooLarge, never a native Huma rejection.
-func (h *ValidationHandler) validate(ctx context.Context, rawBody []byte) (*services.ValidateResult, error) {
+func (h *ValidationHandler) validate(ctx context.Context, rawBody []byte, rulesOnly bool) (*services.ValidateResult, error) {
 	logger, tracer, _, _ := libObservability.NewTrackingFromContext(ctx)
 
 	ctx, span := tracer.Start(ctx, "handler.validations.validate")
@@ -151,6 +151,8 @@ func (h *ValidationHandler) validate(ctx context.Context, rawBody []byte) (*serv
 
 		return nil, pkg.ValidateBusinessError(err, constant.EntityValidationRequest)
 	}
+
+	request.RulesOnly = rulesOnly
 
 	span.SetAttributes(
 		attribute.String("app.request.request_id", request.RequestID.String()),

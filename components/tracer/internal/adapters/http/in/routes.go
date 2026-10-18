@@ -457,7 +457,7 @@ type tracerHumaHandlers struct {
 	Dashboard *DashboardHandler
 }
 
-// registerTracerHumaRoutes mounts all 27 tracer Huma operations on the given
+// registerTracerHumaRoutes mounts all 28 tracer Huma operations on the given
 // Huma API, attaching each op's pre-Huma Fiber auth chain to the SAME /v1 group
 // first. It is the single registration seam shared by production (NewRoutes) and
 // the http/in tests, so the mounted surface is identical without a running
@@ -515,10 +515,11 @@ func registerTracerHumaRoutes(api fiber.Router, humaAPI huma.API, h tracerHumaHa
 	api.Get("/validations/:validation_id", guard.With("validations", "get", false))
 	RegisterTransactionValidationRoutes(humaAPI, h.TransactionValidation)
 
-	// Validation endpoint POST — Huma.
+	// Validation endpoints POST (full and rules-only, same authz tuple) — Huma.
 	// When APIKeyOnlyValidation=true, uses API key auth only (bypasses plugin auth).
 	// The 3rd guard arg is APIKeyOnlyValidation (config-driven), NOT a literal.
 	api.Post("/validations", guard.With("validations", "post", h.APIKeyOnlyValidation))
+	api.Post("/validations/rules-only", guard.With("validations", "post", h.APIKeyOnlyValidation))
 	RegisterValidationRoutes(humaAPI, h.Validation)
 
 	// Audit Event endpoints (read-only per SOX/GLBA requirements) — Huma.

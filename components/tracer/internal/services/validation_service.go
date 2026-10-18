@@ -159,7 +159,7 @@ func (s *ValidationService) SetMultiTenantMetrics(m metrics.MultiTenantMetrics) 
 //
 // The validation uses database transactions to ensure atomicity:
 //   - Dedup check and rule evaluation happen OUTSIDE a transaction
-//   - DENY-by-rule: persists validation+audit in separate transaction (no counters involved)
+//   - DENY-by-rule or rules-only request: persists validation+audit outside any transaction (no counters involved)
 //   - Limit checks, validation persistence, and audit recording happen INSIDE a transaction
 //   - If limit exceeded or REVIEW: tx.Rollback() atomically undoes counter increments
 //   - If ALLOW: COMMIT saves counters, validation record, and audit event atomically
@@ -239,9 +239,9 @@ func (s *ValidationService) Validate(ctx context.Context, req *model.ValidationR
 	response.EvaluationResult = *evalResult
 	response.Decision = evalResult.Decision
 
-	// If DENY by rule, return immediately (don't check limits)
-	// Persist using non-transactional helpers since no counters are involved
-	if evalResult.Decision == model.DecisionDeny {
+	// DENY by rule, or any verdict on a rules-only request, never checks limits:
+	// persist with the non-transactional helpers since no counters are involved.
+	if evalResult.Decision == model.DecisionDeny || req.RulesOnly {
 		response.ProcessingTimeMs = float64(time.Since(startTime).Nanoseconds()) / 1e6
 
 		return s.finalizeDenyByRule(ctx, req, response, logger), nil
@@ -506,9 +506,9 @@ func (s *ValidationService) emitMessageProcessed(ctx context.Context, result *Va
 	s.mtMetrics.IncMessagesProcessed(ctx, tenantID, trcConstant.ModuleName, decisionLabel)
 }
 
-// finalizeDenyByRule handles the DENY-by-rule terminal branch: persist the
-// validation record and audit event outside of any transaction (no counters
-// are involved on this path) and return the canonical ValidateResult.
+// finalizeDenyByRule handles the no-counter terminal branch (DENY by rule, or
+// any verdict on a rules-only request): persist the validation record and audit
+// event outside of any transaction and return the canonical ValidateResult.
 //
 // Preserves the H2 idempotency contract: when persistTransactionValidation
 // surfaces command.ErrDuplicateValidation, the loser of a concurrent
@@ -814,6 +814,11 @@ func buildRequestSnapshot(req *model.ValidationRequest) map[string]any {
 			"metadata": req.Account.Metadata,
 		},
 		"metadata": req.Metadata,
+	}
+
+	// Only marked when set, so full-validation snapshots stay byte-identical in the hash chain.
+	if req.RulesOnly {
+		requestSnapshot["rulesOnly"] = true
 	}
 
 	if req.Segment != nil {

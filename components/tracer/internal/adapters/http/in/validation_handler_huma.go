@@ -57,7 +57,18 @@ type ValidateOutputHuma struct {
 // shared core and maps result.IsDuplicate to the DD-9 dual status: 200 for a
 // duplicate (idempotent) request, 201 for a new one.
 func (h *ValidationHandler) ValidateHuma(ctx context.Context, in *ValidateInputHuma) (*ValidateOutputHuma, error) {
-	result, err := h.validate(ctx, in.RawBody)
+	return h.validateHuma(ctx, in.RawBody, false)
+}
+
+// ValidateRulesOnlyHuma is the Huma handler for POST /v1/validations/rules-only:
+// the ValidateHuma contract, with the verdict judged by rules alone (no limit is
+// checked or counted).
+func (h *ValidationHandler) ValidateRulesOnlyHuma(ctx context.Context, in *ValidateInputHuma) (*ValidateOutputHuma, error) {
+	return h.validateHuma(ctx, in.RawBody, true)
+}
+
+func (h *ValidationHandler) validateHuma(ctx context.Context, rawBody []byte, rulesOnly bool) (*ValidateOutputHuma, error) {
+	result, err := h.validate(ctx, rawBody, rulesOnly)
 	if err != nil {
 		return nil, humaProblem(err)
 	}
@@ -70,24 +81,36 @@ func (h *ValidationHandler) ValidateHuma(ctx context.Context, in *ValidateInputH
 	return &ValidateOutputHuma{Status: status, Body: result.Response}, nil
 }
 
-// RegisterValidationRoutes registers the migrated validate operation on the shared
-// Huma API. It is the per-file seam NewRoutes calls; the auth middleware for this
-// route is attached in routes.go (Fiber-level), not here. Path is GROUP-RELATIVE
+// RegisterValidationRoutes registers the two validate operations on the shared
+// Huma API. It is the per-file seam NewRoutes calls; the auth middleware for these
+// routes is attached in routes.go (Fiber-level), not here. Paths are GROUP-RELATIVE
 // to the /v1 Fiber group.
 func RegisterValidationRoutes(api huma.API, h *ValidationHandler) {
-	huma.Register(api, huma.Operation{
-		OperationID: "validateTransaction",
+	huma.Register(api, validateOperation("validateTransaction", "/validations", "Validate a transaction", ""), h.ValidateHuma)
+	huma.Register(api, validateOperation("validateTransactionRulesOnly", "/validations/rules-only",
+		"Validate a transaction by rules only",
+		"Same request, response and errors as POST /v1/validations, judged by rules alone: no limit is checked or counted. "+
+			"requestId is one idempotency space shared with POST /v1/validations: a requestId already used on either route "+
+			"returns that stored verdict, so never reuse one across routes."), h.ValidateRulesOnlyHuma)
+}
+
+// validateOperation builds a fresh operation per call: huma.Register mutates the
+// Responses map, so the two validate operations must never share one.
+func validateOperation(id, path, summary, description string) huma.Operation {
+	return huma.Operation{
+		OperationID: id,
 		Method:      http.MethodPost,
-		Path:        "/validations",
-		Summary:     "Validate a transaction",
+		Path:        path,
+		Summary:     summary,
+		Description: description,
 		Tags:        []string{"Validations"},
 		// Bearer|ApiKey union: runtime auth is config-driven —
 		// guard.With("validations","post", cfg.APIKeyOnlyValidation). That flag
 		// (API_KEY_ENABLED_ONLY_VALIDATION) defaults false and is forbidden in
 		// multi-tenant, so the default and all MT deployments run Protect() =
 		// Bearer (plugin on) or ApiKey (plugin off). A static spec cannot mirror a
-		// runtime flag, so advertise the union-of-modes superset, identical to the
-		// other 27 ops. Spec metadata only; runtime auth stays the Fiber guard.
+		// runtime flag, so advertise the union-of-modes superset, identical to
+		// every other op. Spec metadata only; runtime auth stays the Fiber guard.
 		Security: secBearerOrAPIKey,
 		// SkipValidateBody: the body is taken as RawBody and validated imperatively
 		// by NormalizeAndValidate inside the core, which produces the canonical
@@ -100,5 +123,5 @@ func RegisterValidationRoutes(api huma.API, h *ValidationHandler) {
 		Responses: map[string]*huma.Response{
 			"201": {Description: "New validation created"},
 		},
-	}, h.ValidateHuma)
+	}
 }
