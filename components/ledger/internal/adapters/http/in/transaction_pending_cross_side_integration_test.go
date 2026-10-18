@@ -66,7 +66,10 @@ func TestIntegration_TransactionV2Commit_SameAccountOnBothSidesHold(t *testing.T
 	require.Equal(t, int64(1), removed, "the hold's engine index entry must exist before its removal")
 	require.NoError(t, redisClient.Del(ctx, utils.WriteBehindTransactionKey(infra.orgID, infra.ledgerID, holdID.String())).Err())
 
-	_ = decodeTxResponse(t, postTransaction(t, v2App, v2CommitURL(infra.orgID, infra.ledgerID, holdID), "", ""), nethttp.StatusCreated)
+	commitURL := v2CommitURL(infra.orgID, infra.ledgerID, holdID)
+	_ = decodeTxResponse(t, postTransaction(t, v2App, commitURL, "", ""), nethttp.StatusCreated)
+	// A retried commit is refused, so the assertions below also prove it posted nothing.
+	_ = decodeTxResponse(t, postTransaction(t, v2App, commitURL, "", ""), nethttp.StatusConflict)
 	drainBalanceSync(t, ctx, infra.handler.Command, infra.redisRepo, infra.orgID, infra.ledgerID)
 	assert.Equal(t, cn.APPROVED, postgrestestutil.GetTransactionStatus(t, db, holdID), "the committed hold should be APPROVED")
 
