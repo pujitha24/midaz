@@ -957,9 +957,7 @@ func InitServersWithOptions(opts *Options) (*Service, error) {
 		return nil, fmt.Errorf("failed to initialize streaming emitter: %w", err)
 	}
 
-	if streamingClose != nil {
-		addCleanup(func() { _ = streamingClose() })
-	}
+	addCleanup(func() { _ = streamingClose() })
 
 	// === Use cases ===
 
@@ -1315,6 +1313,7 @@ func InitServersWithOptions(opts *Options) (*Service, error) {
 		humaMountDeps.MountV2,
 		streamingManifestRegistrar,
 	)
+	unifiedServer.onShutdown = drainEventsThenCloseProducer(commandUseCase, streamingClose, logger)
 
 	// === Workers ===
 
@@ -1441,8 +1440,6 @@ func InitServersWithOptions(opts *Options) (*Service, error) {
 		Logger:                   logger,
 		Telemetry:                telemetry,
 		metricsFactory:           rmq.metricsFactory,
-		StreamingClose:           streamingClose,
-		StreamingEnabled:         cfg.StreamingEnabled,
 		DeclarationStops:         declarationStops,
 		TracerClose:              tracerClose,
 		ServiceDiscovery:         sd.manager,

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	tmcore "github.com/LerianStudio/lib-commons/v7/commons/tenant-manager/core"
 	"github.com/google/uuid"
@@ -225,6 +226,122 @@ func TestEngineWriteBehindRabbitDispatchRejectsUnsupportedVersion(t *testing.T) 
 	dispatcher := requireRabbitTransactionDispatcher(t, &command.UseCase{AppliedTransactionCompleter: &rabbitCompletionStub{}}, rabbitEngineSingleTenant, false)
 	err := dispatcher.handle(context.Background(), []byte(`{"formatVersion":99}`))
 	require.EqualError(t, err, "unsupported RabbitMQ transaction version 99")
+}
+
+// blockingCompletionStub holds every completion until release closes, standing
+// in for a handler still committing, and records whether its context was then
+// cancelled.
+type blockingCompletionStub struct {
+	release chan struct{}
+	ctxErr  error
+}
+
+func (stub *blockingCompletionStub) Complete(ctx context.Context, record *command.TransactionCompletionRecord) (command.TransactionCompletionResult, error) {
+	<-stub.release
+	stub.ctxErr = ctx.Err()
+
+	return rabbitCompletionResult(record), nil
+}
+
+func (stub *blockingCompletionStub) CompleteBulk(ctx context.Context, records []*command.TransactionCompletionRecord) ([]command.TransactionCompletionResult, error) {
+	<-stub.release
+	stub.ctxErr = ctx.Err()
+
+	results := make([]command.TransactionCompletionResult, len(records))
+	for index, record := range records {
+		results[index] = rabbitCompletionResult(record)
+	}
+
+	return results, nil
+}
+
+// rabbitDispatcherEntries delivers one engine message through each consumer entry.
+func rabbitDispatcherEntries(body []byte) map[string]func(context.Context, *rabbitTransactionDispatcher) error {
+	return map[string]func(context.Context, *rabbitTransactionDispatcher) error{
+		"handle": func(ctx context.Context, dispatcher *rabbitTransactionDispatcher) error {
+			return dispatcher.handle(ctx, body)
+		},
+		"handleBulk": func(ctx context.Context, dispatcher *rabbitTransactionDispatcher) error {
+			_, err := dispatcher.handleBulk(ctx, []amqp.Delivery{{Body: body}})
+			return err
+		},
+	}
+}
+
+// A handler already committing when the consumers stop finishes its commit:
+// aborted mid-COMMIT, its redelivery would replay as noop and publish nothing.
+func TestRabbitTransactionDispatcherFinishesACommitInFlightWhenTheConsumersStop(t *testing.T) {
+	writeBehind, _, _ := rabbitEngineMessages(t)
+
+	for name, deliver := range rabbitDispatcherEntries(writeBehind) {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				completer := &blockingCompletionStub{release: make(chan struct{})}
+				dispatcher := requireRabbitTransactionDispatcher(t, &command.UseCase{AppliedTransactionCompleter: completer}, rabbitEngineSingleTenant, true)
+				consuming, stopConsumers := context.WithCancel(context.Background())
+
+				done := make(chan error, 1)
+
+				go func() { done <- deliver(consuming, dispatcher) }()
+
+				synctest.Wait()
+				stopConsumers()
+				close(completer.release)
+
+				require.NoError(t, <-done)
+				assert.NoError(t, completer.ctxErr, "the commit runs on a context the stop does not cancel")
+			})
+		})
+	}
+}
+
+// A handler is counted from entry, so the shutdown hook waits for the events a
+// commit it is still making will dispatch.
+func TestRabbitTransactionDispatcherCountsARunningHandler(t *testing.T) {
+	writeBehind, _, _ := rabbitEngineMessages(t)
+
+	for name, deliver := range rabbitDispatcherEntries(writeBehind) {
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				completer := &blockingCompletionStub{release: make(chan struct{})}
+				dispatcher := requireRabbitTransactionDispatcher(t, &command.UseCase{AppliedTransactionCompleter: completer}, rabbitEngineSingleTenant, true)
+
+				done := make(chan error, 1)
+
+				go func() { done <- deliver(context.Background(), dispatcher) }()
+
+				synctest.Wait()
+
+				held, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+				defer cancel()
+
+				assert.Equal(t, int64(1), dispatcher.useCase.WaitEventDispatches(held), "a handler mid-commit is running")
+
+				close(completer.release)
+				require.NoError(t, <-done)
+				assert.Zero(t, dispatcher.useCase.WaitEventDispatches(context.Background()), "the handler stops counting once it returns")
+			})
+		})
+	}
+}
+
+// After the consumers stop, a delivery arrives with a cancelled context: it is
+// refused before any commit and stays unacked for redelivery.
+func TestRabbitTransactionDispatcherRefusesADeliveryAfterTheConsumersStop(t *testing.T) {
+	writeBehind, _, _ := rabbitEngineMessages(t)
+	completer := &rabbitCompletionStub{}
+	dispatcher := requireRabbitTransactionDispatcher(t, &command.UseCase{AppliedTransactionCompleter: completer}, rabbitEngineSingleTenant, true)
+
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	require.ErrorIs(t, dispatcher.handle(stopped, writeBehind), context.Canceled)
+
+	_, err := dispatcher.handleBulk(stopped, []amqp.Delivery{{Body: writeBehind}})
+	require.ErrorIs(t, err, context.Canceled)
+
+	assert.Empty(t, completer.records, "no completion ran")
+	assert.Empty(t, completer.bulkRecords, "no bulk completion ran")
 }
 
 func TestEngineWriteBehindRabbitDispatchEnforcesTenantPolicyBeforeCompletion(t *testing.T) {

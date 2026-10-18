@@ -105,6 +105,14 @@ func (dispatcher *rabbitTransactionDispatcher) handle(ctx context.Context, body 
 		return fmt.Errorf("RabbitMQ transaction dispatcher is not configured")
 	}
 
+	// Counted from entry: stopping the consumers does not wait for a handler
+	// already past the ctx check, so its commit can dispatch events after the
+	// shutdown hook starts.
+	defer dispatcher.useCase.TrackEventDispatch()()
+
+	// Refuse new work at entry; never abort a commit in flight.
+	ctx = context.WithoutCancel(ctx)
+
 	direct, isEngine, err := decodeRabbitEngineValue(body)
 	if err != nil {
 		return err
@@ -199,6 +207,11 @@ func (dispatcher *rabbitTransactionDispatcher) handleBulk(ctx context.Context, d
 	if dispatcher == nil || dispatcher.useCase == nil {
 		return nil, fmt.Errorf("RabbitMQ transaction dispatcher is not configured")
 	}
+
+	defer dispatcher.useCase.TrackEventDispatch()()
+
+	// Refuse new work at entry; never abort a commit in flight.
+	ctx = context.WithoutCancel(ctx)
 
 	decoded := make([]decodedRabbitTransactionMessage, len(deliveries))
 

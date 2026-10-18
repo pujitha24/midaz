@@ -120,6 +120,33 @@ func TestRetryManager_TransientAtMaxRetries_NacksToDLQ(t *testing.T) {
 	assert.False(t, ack.nackRequeue, "at max retries must nack to DLQ (requeue=false)")
 }
 
+// A delivery the bulk fallback processes after the consumers stopped stays unacked
+// for redelivery even with its retry budget spent: no nack, no republish, no DLQ.
+func TestProcessIndividualMessage_ConsumersStopped_LeavesTheDeliveryUnacked(t *testing.T) {
+	t.Parallel()
+
+	ack := &mockAcknowledger{}
+	delivery := amqp.Delivery{
+		Acknowledger: ack,
+		DeliveryTag:  4,
+		Body:         []byte("msg"),
+		Headers:      amqp.Table{pkgRabbitmq.RetryCountHeader: maxMessageRetries},
+	}
+
+	channel := &spyChannel{}
+	cr := &ConsumerRoutes{Logger: testLogger}
+
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cr.processIndividualMessage(stopped, newTestRetryManager(channel), "transaction.queue", delivery,
+		func(context.Context, []byte) error { return errors.New("transient infra failure") })
+
+	assert.False(t, ack.nackCalled, "a stopped consumer must not nack, which would dead-letter the delivery")
+	assert.False(t, ack.ackCalled, "a stopped consumer must not ack a failed delivery")
+	assert.False(t, channel.publishCalled, "a stopped consumer must not republish")
+}
+
 // TestRetryManager_NilChannelAtConstruction_NacksToDLQ ensures a manager built without
 // a channel (untyped nil or typed-nil *amqp.Channel) dead-letters a transient failure
 // under budget and returns the republish error to the engine, which leaves the original

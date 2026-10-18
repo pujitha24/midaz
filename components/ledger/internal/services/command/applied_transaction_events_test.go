@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	libStreaming "github.com/LerianStudio/lib-streaming/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
@@ -83,6 +84,42 @@ func TestPublishAppliedTransactionEventsEmitsNothingForNoopPhase(t *testing.T) {
 	assert.Never(t, func() bool {
 		return len(recorder.Events()) > 0 || rabbitPublishes.Load() > 0
 	}, 300*time.Millisecond, 10*time.Millisecond, "a noop completion must not publish on any channel")
+}
+
+// gatedEmitter holds every Emit until release closes, standing in for a broker
+// that has not acknowledged yet.
+type gatedEmitter struct {
+	*pkgStreaming.MockEmitter
+	release chan struct{}
+}
+
+func (e *gatedEmitter) Emit(ctx context.Context, request libStreaming.EmitRequest) error {
+	<-e.release
+
+	return e.MockEmitter.Emit(ctx, request)
+}
+
+// A shutdown must see an applied dispatch as running until its emits return, so
+// the producer is not closed under it.
+func TestWaitEventDispatchesCountsAnAppliedDispatchUntilItsEmitsReturn(t *testing.T) {
+	uc, recorder, _ := appliedEventsUseCase(t)
+	gate := &gatedEmitter{MockEmitter: recorder, release: make(chan struct{})}
+	uc.Streaming = gate
+
+	uc.PublishAppliedTransactionEvents(context.Background(), balanceAffectingOverdraftTransaction(), TransactionLifecyclePhaseCreated)
+
+	held, cancelHeld := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancelHeld()
+
+	assert.Equal(t, int64(1), uc.WaitEventDispatches(held), "a dispatch whose emits are blocked is still running")
+
+	close(gate.release)
+
+	drained, cancelDrained := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelDrained()
+
+	require.Equal(t, int64(0), uc.WaitEventDispatches(drained), "the dispatch ends once its emits return")
+	assert.Equal(t, 3, countEventsByKey(recorder, "balance.changed"), "every emit ran before the dispatch was released")
 }
 
 func TestPublishAppliedTransactionEventsEmitsBalanceAndOverdraftForPersistingPhases(t *testing.T) {

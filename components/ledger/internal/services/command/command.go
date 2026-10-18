@@ -6,6 +6,7 @@ package command
 
 import (
 	"context"
+	"sync/atomic"
 	"time"
 
 	libLog "github.com/LerianStudio/lib-observability/v4/log"
@@ -255,6 +256,10 @@ type UseCase struct {
 	// MultiTenantEnabled gates the fee-seam tenant resolution. When false the
 	// static fee connection is correct and resolveFeesTenantContext is a no-op.
 	MultiTenantEnabled bool
+
+	// eventDispatches counts work that may still emit streaming events; the
+	// shutdown hook waits for it before closing the producer.
+	eventDispatches atomic.Int64
 
 	// --- Observability (D6) ---
 

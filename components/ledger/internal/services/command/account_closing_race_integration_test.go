@@ -381,8 +381,17 @@ func (c *accountClosingGatedCache) holdAfter(point accountClosingHoldPoint, appl
 func (h *accountClosingHarness) gatedAttempt(ctx context.Context, accountID uuid.UUID, point accountClosingHoldPoint) (*accountClosingGate, <-chan error) {
 	gate := newAccountClosingGate()
 
-	uc := *h.uc
-	uc.TransactionRedisRepo = &accountClosingGatedCache{RedisRepository: h.uc.TransactionRedisRepo, gate: gate, point: point}
+	// Every field a harness test sets: UseCase holds an atomic counter and is never copied.
+	uc := &UseCase{
+		AccountRepo:            h.uc.AccountRepo,
+		BalanceRepo:            h.uc.BalanceRepo,
+		TransactionRepo:        h.uc.TransactionRepo,
+		OperationRepo:          h.uc.OperationRepo,
+		TransactionRedisRepo:   &accountClosingGatedCache{RedisRepository: h.uc.TransactionRedisRepo, gate: gate, point: point},
+		TransactionReader:      h.uc.TransactionReader,
+		FeeDebts:               h.uc.FeeDebts,
+		OnboardingMetadataRepo: h.uc.OnboardingMetadataRepo,
+	}
 
 	done := make(chan error, 1)
 

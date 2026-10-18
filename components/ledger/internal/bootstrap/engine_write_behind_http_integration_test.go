@@ -538,9 +538,10 @@ func TestIntegrationEngineWriteBehindConsumerWiring(t *testing.T) {
 			if testCase.bulk {
 				routes.ConfigureBulk(&ledgerRabbitMQ.BulkConfig{Enabled: true, Size: 1, FlushTimeout: time.Second})
 			}
-			consumer, err := NewMultiQueueConsumer(routes, infra.command, testCase.bulk, nil)
+			_, err = NewMultiQueueConsumer(routes, infra.command, testCase.bulk, nil)
 			require.NoError(t, err)
-			require.NoError(t, consumer.Run(nil))
+			// The consumer's own Run blocks until SIGTERM; the test owns the stop.
+			require.NoError(t, routes.RunConsumers())
 
 			select {
 			case <-countingCompleter.completed:

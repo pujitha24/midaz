@@ -26,10 +26,9 @@ import (
 	"github.com/LerianStudio/midaz/v4/pkg/constant"
 	"github.com/LerianStudio/midaz/v4/pkg/mmodel"
 	"github.com/LerianStudio/midaz/v4/pkg/mtransaction"
-	"github.com/LerianStudio/midaz/v4/pkg/repository"
 )
 
-// Both post-commit emitter fan-outs spawn a detached goroutine that declares a
+// The post-commit emitter fan-out spawns a detached goroutine that declares a
 // WaitGroup count and then blocks in wg.Wait() until that many wg.Done() calls
 // arrive. The count and the number of spawned emitter goroutines are two numbers
 // that must agree, and NOTHING about the surrounding code makes them agree: they
@@ -182,72 +181,4 @@ func TestCreateBalanceTransactionOperationsAsync_EmitterFanOutDrains(t *testing.
 	require.NoError(t, uc.CreateBalanceTransactionOperationsAsync(context.Background(), queue))
 
 	requireFanOutDrains(t, "dispatchTransactionEvents")
-}
-
-// TestCreateBulkTransactionOperationsAsync_EmitterFanOutDrains pins the same
-// invariant on the bulk path, which carries its own independent copy of the
-// wg.Add / goroutine pair.
-func TestCreateBulkTransactionOperationsAsync_EmitterFanOutDrains(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	mockTransactionRepo := transaction.NewMockRepository(ctrl)
-	mockOperationRepo := operation.NewMockRepository(ctrl)
-	mockMetadataRepo := mongodb.NewMockRepository(ctrl)
-	mockBalanceRepo := balance.NewMockRepository(ctrl)
-	mockRabbitMQRepo := rabbitmq.NewMockProducerRepository(ctrl)
-	mockRedisRepo := redis.NewMockRedisRepository(ctrl)
-
-	uc := &UseCase{
-		TransactionRepo:         mockTransactionRepo,
-		OperationRepo:           mockOperationRepo,
-		TransactionMetadataRepo: mockMetadataRepo,
-		BalanceRepo:             mockBalanceRepo,
-		RabbitMQRepo:            mockRabbitMQRepo,
-		TransactionRedisRepo:    mockRedisRepo,
-	}
-
-	orgID := uuid.New()
-	ledgerID := uuid.New()
-	transactionID := uuid.New().String()
-
-	tx := &transaction.Transaction{
-		ID:             transactionID,
-		OrganizationID: orgID.String(),
-		LedgerID:       ledgerID.String(),
-		Status:         transaction.Status{Code: constant.APPROVED},
-		Operations: []*operation.Operation{
-			{ID: uuid.New().String(), TransactionID: transactionID},
-		},
-	}
-
-	payload := transaction.TransactionProcessingPayload{
-		Transaction:   tx,
-		Validate:      &mtransaction.Responses{Aliases: []string{"alias1"}},
-		Balances:      []*mmodel.Balance{{ID: uuid.New().String(), Alias: "alias1", Available: decimal.NewFromInt(100)}},
-		BalancesAfter: []*mmodel.Balance{{ID: uuid.New().String(), Alias: "alias1", Available: decimal.NewFromInt(50)}},
-		Version:       "v2",
-	}
-
-	mockTx := &mockDBTransaction{}
-	mockTransactionRepo.EXPECT().BeginTx(gomock.Any()).Return(mockTx, nil).Times(1)
-	mockTransactionRepo.EXPECT().
-		CreateBulkTx(gomock.Any(), mockTx, gomock.Any()).
-		Return(&repository.BulkInsertResult{Attempted: 1, Inserted: 1}, nil).Times(1)
-	mockOperationRepo.EXPECT().
-		CreateBulkTx(gomock.Any(), mockTx, gomock.Any()).
-		Return(&repository.BulkInsertResult{Attempted: 1, Inserted: 1}, nil).Times(1)
-	mockMetadataRepo.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-	mockRabbitMQRepo.EXPECT().
-		ProducerDefault(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(nil, nil).AnyTimes()
-	mockRedisRepo.EXPECT().RemoveMessageFromQueue(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-	mockRedisRepo.EXPECT().Del(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
-
-	_, err := uc.CreateBulkTransactionOperationsAsync(
-		context.Background(), []transaction.TransactionProcessingPayload{payload},
-	)
-	require.NoError(t, err)
-
-	requireFanOutDrains(t, "processMetadataAndEvents")
 }

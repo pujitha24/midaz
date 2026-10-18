@@ -174,8 +174,8 @@ func validateDeclarationConfig(cfg *Config) error {
 // declarationPublisherRunnable adapts the RI declaration publishers' stop hooks to
 // the libCommons.App interface. It blocks until SIGINT/SIGTERM and then invokes
 // every publisher's stop() so each publisher's background loop is cancelled and
-// drained before the process exits. It mirrors streamingProducerRunnable; it holds
-// no logger because stop() returns nothing to log.
+// drained before the process exits. It holds no logger because stop() returns
+// nothing to log.
 type declarationPublisherRunnable struct {
 	stops []func()
 }

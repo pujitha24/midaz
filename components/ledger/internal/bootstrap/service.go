@@ -37,17 +37,6 @@ type Service struct {
 	Telemetry                *libOpentelemetry.Telemetry
 	metricsFactory           *metrics.MetricsFactory
 
-	// StreamingClose is the close hook for the lib-streaming producer. It
-	// is non-nil for both the real producer and the NoopEmitter — callers
-	// register it as a Launcher app so a graceful shutdown drains buffered
-	// records before exit. Registered conditionally so the Launcher does
-	// not start an entry that has nothing to do (e.g. when streaming is
-	// disabled and the close func is the no-op).
-	StreamingClose func() error
-	// StreamingEnabled mirrors the config flag so Run() can decide whether
-	// to register the producer-shutdown Launcher app.
-	StreamingEnabled bool
-
 	// DeclarationStops holds the stop() hook of each RI permission-declaration
 	// publisher that started successfully. It is empty when declaration is
 	// disabled or every publisher was fail-open skipped, so the shutdown runnable
@@ -182,16 +171,6 @@ func (s *Service) launcherApps() []launcherApp {
 		})
 	}
 
-	// Streaming producer: register only when streaming is actually enabled AND we
-	// have a non-nil close hook. The NoopEmitter path is skipped to keep the
-	// Launcher app list lean.
-	if s.StreamingEnabled && s.StreamingClose != nil {
-		apps = append(apps, launcherApp{
-			"Streaming Producer",
-			&streamingProducerRunnable{close: s.StreamingClose, logger: s.Logger},
-		})
-	}
-
 	// RI declaration publishers: register only when at least one publisher
 	// started. Empty means declaration is off or every publisher was fail-open
 	// skipped, so no runnable / goroutine is added.
@@ -240,40 +219,6 @@ func (r *tracerCloseRunnable) Run(_ *libCommons.Launcher) error {
 		r.logger.Log(
 			context.Background(), libLog.LevelWarn,
 			"tracer reservation client Close returned error",
-			libLog.String("error", err.Error()),
-		)
-	}
-
-	return nil
-}
-
-// streamingProducerRunnable adapts the lib-streaming Producer's Close hook
-// to the libCommons.App interface. It blocks until SIGINT/SIGTERM and then
-// runs the producer's drain/flush close path so buffered records reach the
-// broker before the process exits.
-type streamingProducerRunnable struct {
-	close  func() error
-	logger libLog.Logger
-}
-
-// Run blocks until SIGINT/SIGTERM and then invokes the producer close hook.
-// The close hook is responsible for draining records under
-// STREAMING_CLOSE_TIMEOUT_S; a non-nil return is logged but not propagated
-// because at shutdown the Launcher cannot meaningfully react.
-func (r *streamingProducerRunnable) Run(_ *libCommons.Launcher) error {
-	if r == nil || r.close == nil {
-		return nil
-	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	<-ctx.Done()
-
-	if err := r.close(); err != nil && r.logger != nil {
-		r.logger.Log(
-			context.Background(), libLog.LevelWarn,
-			"streaming producer Close returned error",
 			libLog.String("error", err.Error()),
 		)
 	}
